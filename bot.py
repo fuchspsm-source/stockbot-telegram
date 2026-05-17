@@ -277,7 +277,7 @@ def extract_cogs_query(user_input):
     text = user_input.upper().strip()
     for kw in COGS_KEYWORDS:
         text = text.replace(kw, ' ')
-    stop_words = {'BERAPA', 'YA', 'DONG', 'PRODUK', 'BARANG', 'UNTUK'}
+    stop_words = {'BERAPA', 'YA', 'DONG', 'PRODUK', 'BARANG', 'UNTUK', 'CARI', 'KODE', 'CODE'}
     words = [w for w in text.split() if w not in stop_words and len(w) > 0]
     return ' '.join(words).strip()
 
@@ -493,20 +493,44 @@ def search_data_for_ai(user_input):
             })
     if DATA['cogs'] is not None:
         df = DATA['cogs']
-        mask = pd.Series([True] * len(df))
-        for kw in words[:3]:
-            mask = mask & df['desc_clean'].str.contains(kw, na=False, regex=False)
-        matches = df[mask].head(20)
-        for _, row in matches.iterrows():
-            nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
-            results['cogs_matches'].append({
-                'code': row['Material Code'],
-                'desc': str(row['Material Description']).strip(),
-                'source': str(row['Source']).strip(),
-                'cogs': int(row['COGS']),
-                'update': str(row['Update']).strip(),
-                'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
-            })
+        
+        # Smart search: cek apakah ada angka panjang (>=6 digit) = Material Code
+        code_candidates = re.findall(r'\b\d{6,}\b', user_input)
+        
+        # Coba match Material Code dulu (exact)
+        if code_candidates:
+            code_mask = df['code_clean'].isin([c.upper() for c in code_candidates])
+            code_matches = df[code_mask]
+            for _, row in code_matches.iterrows():
+                nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
+                results['cogs_matches'].append({
+                    'code': row['Material Code'],
+                    'desc': str(row['Material Description']).strip(),
+                    'source': str(row['Source']).strip(),
+                    'cogs': int(row['COGS']),
+                    'update': str(row['Update']).strip(),
+                    'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
+                })
+        
+        # Lalu match deskripsi (jika belum dapet hasil yang cukup)
+        if len(results['cogs_matches']) < 20:
+            mask = pd.Series([True] * len(df))
+            for kw in words[:3]:
+                mask = mask & df['desc_clean'].str.contains(kw, na=False, regex=False)
+            matches = df[mask].head(20 - len(results['cogs_matches']))
+            for _, row in matches.iterrows():
+                # Skip kalau sudah ada di hasil
+                if any(r['code'] == row['Material Code'] for r in results['cogs_matches']):
+                    continue
+                nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
+                results['cogs_matches'].append({
+                    'code': row['Material Code'],
+                    'desc': str(row['Material Description']).strip(),
+                    'source': str(row['Source']).strip(),
+                    'cogs': int(row['COGS']),
+                    'update': str(row['Update']).strip(),
+                    'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
+                })
     return results
 
 
@@ -574,6 +598,8 @@ def is_simple_query(text_upper):
         r'PALING\s+(BANYAK|SEDIKIT)',
         r'^REKAP',
         r'(STOK|PRODUK)\s+KOSONG',
+        r'\b\d{6,}\b',                  # Material Code (>= 6 digit angka)
+        r'^CARI\s+(KODE|CODE)',         # "cari kode XXXXX"
     ]
     return any(re.search(p, text_upper) for p in simple_patterns)
 
@@ -593,7 +619,9 @@ def route_message(user_input, user_id):
                 return result
     
     if is_simple_query(text_upper):
-        if any(kw in text_upper for kw in COGS_KEYWORDS):
+        # Kalau ada Material Code (angka panjang) atau "cari kode" → langsung ke COGS
+        has_code = bool(re.search(r'\b\d{6,}\b', text_upper))
+        if has_code or any(kw in text_upper for kw in COGS_KEYWORDS):
             result = query_cogs(user_input, user_id)
             if result:
                 return result
