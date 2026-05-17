@@ -23,7 +23,7 @@ ALLOWED_USER_IDS = os.environ.get('ALLOWED_USER_IDS', '')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 
 WAREHOUSE_COLS = ['ID30', 'ID40']
-GEMINI_MODEL = 'gemini-2.0-flash'
+GEMINI_MODEL = 'gemini-2.5-flash-lite'
 MAX_TOKENS = 1500
 MAX_CONTEXT_ROWS = 50  # Max data rows kasih ke AI
 
