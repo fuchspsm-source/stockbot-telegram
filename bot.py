@@ -474,30 +474,50 @@ def search_data_for_ai(user_input):
                   'PRODUK', 'BARANG', 'UNTUK', 'DARI', 'KEMASAN', 'YANG', 'DI',
                   'DAN', 'SEMUA', 'ADA', 'CEK', 'CARI', 'LIHAT', 'TUNJUKKAN',
                   'MODAL', 'HPP', 'JUAL', 'NC', 'BAGAIMANA', 'GIMANA', 'APA',
-                  'SAJA', 'MANA', 'LU', 'GW', 'GUE', 'KAMU', 'SAYA'}
-    words = [w for w in query_upper.split() if w not in stop_words and len(w) > 1]
+                  'SAJA', 'MANA', 'LU', 'GW', 'GUE', 'KAMU', 'SAYA',
+                  'KAYANYA', 'SALAH', 'DEH', 'COBA', 'TOLONG', 'BISA', 'MAU',
+                  'TIDAK', 'GAK', 'NGGAK', 'KOK', 'KAN', 'AJA', 'SIH',
+                  'INI', 'ITU', 'KE', 'DARI', 'PADA', 'OLEH', 'JUGA', 'TAPI',
+                  'NAMUN', 'JADI', 'ATAU', 'KALAU', 'KALO', 'MISAL', 'CONTOH',
+                  'BANYAK', 'SEDIKIT', 'BAGUS', 'JELEK', 'BAIK', 'BURUK'}
+    
+    raw_words = query_upper.split()
+    words = [w for w in raw_words if w not in stop_words and len(w) > 2]
+    
+    # Sort by length desc — kata panjang biasanya lebih unik (nama produk)
+    # Tapi keep order untuk multi-keyword filter
     if not words:
         return results
+    
+    # Prioritize: kata panjang dulu (likely produk name)
+    sorted_words = sorted(set(words), key=lambda w: -len(w))[:5]
     if DATA['stock'] is not None:
         df = DATA['stock']
-        mask = pd.Series([True] * len(df))
-        for kw in words[:3]:
-            mask = mask & df['desc_clean'].str.contains(kw, na=False, regex=False)
-        matches = df[mask].head(20)
-        for _, row in matches.iterrows():
-            results['stock_matches'].append({
-                'desc': str(row['Material Description']).strip(),
-                'ID30': int(row['ID30']),
-                'ID40': int(row['ID40']),
-                'Total': int(row['Total'])
-            })
+        # Smart search: try kombinasi keyword dari yang paling panjang
+        found_codes = set()
+        for kw in sorted_words:
+            kw_mask = df['desc_clean'].str.contains(kw, na=False, regex=False)
+            kw_matches = df[kw_mask].head(10)
+            for idx, row in kw_matches.iterrows():
+                if idx in found_codes:
+                    continue
+                found_codes.add(idx)
+                results['stock_matches'].append({
+                    'desc': str(row['Material Description']).strip(),
+                    'ID30': int(row['ID30']),
+                    'ID40': int(row['ID40']),
+                    'Total': int(row['Total'])
+                })
+                if len(results['stock_matches']) >= 20:
+                    break
+            if len(results['stock_matches']) >= 20:
+                break
+    
     if DATA['cogs'] is not None:
         df = DATA['cogs']
         
-        # Smart search: cek apakah ada angka panjang (>=6 digit) = Material Code
+        # Tier 1: Match Material Code (exact) — kalau ada angka panjang
         code_candidates = re.findall(r'\b\d{6,}\b', user_input)
-        
-        # Coba match Material Code dulu (exact)
         if code_candidates:
             code_mask = df['code_clean'].isin([c.upper() for c in code_candidates])
             code_matches = df[code_mask]
@@ -512,25 +532,30 @@ def search_data_for_ai(user_input):
                     'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
                 })
         
-        # Lalu match deskripsi (jika belum dapet hasil yang cukup)
+        # Tier 2: Match per keyword (longest first, individual search)
         if len(results['cogs_matches']) < 20:
-            mask = pd.Series([True] * len(df))
-            for kw in words[:3]:
-                mask = mask & df['desc_clean'].str.contains(kw, na=False, regex=False)
-            matches = df[mask].head(20 - len(results['cogs_matches']))
-            for _, row in matches.iterrows():
-                # Skip kalau sudah ada di hasil
-                if any(r['code'] == row['Material Code'] for r in results['cogs_matches']):
-                    continue
-                nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
-                results['cogs_matches'].append({
-                    'code': row['Material Code'],
-                    'desc': str(row['Material Description']).strip(),
-                    'source': str(row['Source']).strip(),
-                    'cogs': int(row['COGS']),
-                    'update': str(row['Update']).strip(),
-                    'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
-                })
+            found_codes = set(r['code'] for r in results['cogs_matches'])
+            for kw in sorted_words:
+                kw_mask = df['desc_clean'].str.contains(kw, na=False, regex=False)
+                kw_matches = df[kw_mask].head(15)
+                for _, row in kw_matches.iterrows():
+                    if row['Material Code'] in found_codes:
+                        continue
+                    found_codes.add(row['Material Code'])
+                    nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
+                    results['cogs_matches'].append({
+                        'code': row['Material Code'],
+                        'desc': str(row['Material Description']).strip(),
+                        'source': str(row['Source']).strip(),
+                        'cogs': int(row['COGS']),
+                        'update': str(row['Update']).strip(),
+                        'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
+                    })
+                    if len(results['cogs_matches']) >= 20:
+                        break
+                if len(results['cogs_matches']) >= 20:
+                    break
+    
     return results
 
 
