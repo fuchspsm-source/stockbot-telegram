@@ -185,31 +185,74 @@ def extract_keywords(user_input):
     """Extract keyword penting dari user input."""
     text = user_input.upper()
     codes = re.findall(r'\b\d{6,}\b', text)
-    words = [w for w in text.split() if w not in COMMON_STOP_WORDS and len(w) > 2 and not w.isdigit()]
-    # Pertahankan urutan asli dari user input (bukan sort by length)
-    # supaya kombinasi kata tetap bermakna
+    words = []
     seen = set()
-    words_ordered = []
-    for w in words:
-        if w not in seen:
-            seen.add(w)
-            words_ordered.append(w)
-    return codes, words_ordered
+    for w in text.split():
+        if w in COMMON_STOP_WORDS:
+            continue
+        if w in seen:
+            continue
+        seen.add(w)
+        words.append(w)
+    return codes, words
+
+
+# Token kemasan: angka+satuan (205L, 1000L, 20KG) atau angka besar >= 100
+# "68" tidak dianggap kemasan karena bisa bagian nama produk (VG 68, B 68)
+PACKAGING_TOKEN = re.compile(
+    r'^\d+(L|LT|LITER|KG|G|ML|IBC|PLA|MET|AU|LG|DRUM)$'  # angka+satuan jelas
+    r'|^\d{4,}$',  # angka panjang >= 4 digit (1000, 2000, dll)
+    re.IGNORECASE
+)
+
+
+def split_product_and_packaging(words):
+    """Pisahkan kata nama produk vs ukuran kemasan.
+    Hanya token di akhir yang berupa angka+satuan atau angka >= 4 digit.
+    """
+    product_words = []
+    packaging_words = []
+    trailing = True
+    for w in reversed(words):
+        if trailing and PACKAGING_TOKEN.match(w):
+            packaging_words.insert(0, w)
+        else:
+            trailing = False
+            product_words.insert(0, w)
+    return product_words, packaging_words
 
 
 def build_phrase_variants(words):
-    """Bangun kandidat frasa dari kata-kata user, dari yang paling panjang."""
+    """Bangun kandidat frasa dari kata-kata user, dari yang paling spesifik."""
+    product_words, packaging_words = split_product_and_packaging(words)
     phrases = []
-    # Full phrase dulu
-    if len(words) >= 2:
-        phrases.append(' '.join(words))
-    # Sliding window dari 4 kata turun ke 2
-    for window in range(min(4, len(words)), 1, -1):
-        for i in range(len(words) - window + 1):
-            phrase = ' '.join(words[i:i+window])
+
+    # Tier A: nama produk + kemasan (paling spesifik)
+    if packaging_words and product_words:
+        combined = product_words + packaging_words
+        if len(combined) >= 2:
+            phrases.append(' '.join(combined))
+
+    # Tier B: nama produk saja (sliding window)
+    all_words = product_words if product_words else words
+    if len(all_words) >= 2:
+        full = ' '.join(all_words)
+        if full not in phrases:
+            phrases.append(full)
+    for window in range(min(4, len(all_words)), 1, -1):
+        for i in range(len(all_words) - window + 1):
+            phrase = ' '.join(all_words[i:i+window])
             if phrase not in phrases:
                 phrases.append(phrase)
+
+    # Tier C: kemasan saja
+    if packaging_words:
+        for w in packaging_words:
+            if w not in phrases:
+                phrases.append(w)
+
     return phrases
+
 
 
 def fetch_relevant_data(user_input):
