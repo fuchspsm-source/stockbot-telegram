@@ -186,8 +186,30 @@ def extract_keywords(user_input):
     text = user_input.upper()
     codes = re.findall(r'\b\d{6,}\b', text)
     words = [w for w in text.split() if w not in COMMON_STOP_WORDS and len(w) > 2 and not w.isdigit()]
-    words = sorted(set(words), key=lambda w: -len(w))
-    return codes, words
+    # Pertahankan urutan asli dari user input (bukan sort by length)
+    # supaya kombinasi kata tetap bermakna
+    seen = set()
+    words_ordered = []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            words_ordered.append(w)
+    return codes, words_ordered
+
+
+def build_phrase_variants(words):
+    """Bangun kandidat frasa dari kata-kata user, dari yang paling panjang."""
+    phrases = []
+    # Full phrase dulu
+    if len(words) >= 2:
+        phrases.append(' '.join(words))
+    # Sliding window dari 4 kata turun ke 2
+    for window in range(min(4, len(words)), 1, -1):
+        for i in range(len(words) - window + 1):
+            phrase = ' '.join(words[i:i+window])
+            if phrase not in phrases:
+                phrases.append(phrase)
+    return phrases
 
 
 def fetch_relevant_data(user_input):
@@ -199,40 +221,61 @@ def fetch_relevant_data(user_input):
     stock_found_idx = set()
     cogs_found_codes = set()
 
+    phrase_variants = build_phrase_variants(words)
+
+    def append_stock_row(idx, row):
+        if idx in stock_found_idx:
+            return
+        stock_found_idx.add(idx)
+        stock_data.append({
+            'desc': str(row['Material Description']).strip(),
+            'code': str(row.get('code_clean', '')),
+            'ID30': int(row['ID30']),
+            'ID40': int(row['ID40']),
+            'Total': int(row['Total'])
+        })
+
+    def append_cogs_row(row):
+        if row['Material Code'] in cogs_found_codes:
+            return
+        cogs_found_codes.add(row['Material Code'])
+        nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
+        cogs_data.append({
+            'code': row['Material Code'],
+            'desc': str(row['Material Description']).strip(),
+            'source': str(row['Source']).strip(),
+            'cogs': int(row['COGS']),
+            'update': str(row['Update']).strip(),
+            'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
+        })
+
     # ─── STOCK ───
     if DATA['stock'] is not None:
         df = DATA['stock']
 
+        # Tier 0: Exact material code
         if codes and 'code_clean' in df.columns:
             for code in codes:
-                code_mask = df['code_clean'] == code.upper()
-                for idx, row in df[code_mask].iterrows():
-                    if idx in stock_found_idx:
-                        continue
-                    stock_found_idx.add(idx)
-                    stock_data.append({
-                        'desc': str(row['Material Description']).strip(),
-                        'code': str(row.get('code_clean', '')),
-                        'ID30': int(row['ID30']),
-                        'ID40': int(row['ID40']),
-                        'Total': int(row['Total'])
-                    })
+                for idx, row in df[df['code_clean'] == code.upper()].iterrows():
+                    append_stock_row(idx, row)
 
+        # Tier 1: Phrase match (paling spesifik dulu, e.g. "RENOLIN B 68 PLUS")
+        for phrase in phrase_variants:
+            if len(stock_data) >= MAX_CONTEXT_ROWS:
+                break
+            phrase_mask = df['desc_clean'].str.contains(phrase, na=False, regex=False)
+            for idx, row in df[phrase_mask].head(30).iterrows():
+                append_stock_row(idx, row)
+                if len(stock_data) >= MAX_CONTEXT_ROWS:
+                    break
+
+        # Tier 2: Per kata (fallback jika phrase tidak cukup hasil)
         for kw in words[:5]:
             if len(stock_data) >= MAX_CONTEXT_ROWS:
                 break
             kw_mask = df['desc_clean'].str.contains(kw, na=False, regex=False)
-            for idx, row in df[kw_mask].head(15).iterrows():
-                if idx in stock_found_idx:
-                    continue
-                stock_found_idx.add(idx)
-                stock_data.append({
-                    'desc': str(row['Material Description']).strip(),
-                    'code': str(row.get('code_clean', '')),
-                    'ID30': int(row['ID30']),
-                    'ID40': int(row['ID40']),
-                    'Total': int(row['Total'])
-                })
+            for idx, row in df[kw_mask].head(10).iterrows():
+                append_stock_row(idx, row)
                 if len(stock_data) >= MAX_CONTEXT_ROWS:
                     break
 
@@ -240,40 +283,29 @@ def fetch_relevant_data(user_input):
     if DATA['cogs'] is not None:
         df = DATA['cogs']
 
+        # Tier 0: Exact material code
         if codes:
             for code in codes:
-                code_mask = df['code_clean'] == code.upper()
-                for _, row in df[code_mask].iterrows():
-                    if row['Material Code'] in cogs_found_codes:
-                        continue
-                    cogs_found_codes.add(row['Material Code'])
-                    nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
-                    cogs_data.append({
-                        'code': row['Material Code'],
-                        'desc': str(row['Material Description']).strip(),
-                        'source': str(row['Source']).strip(),
-                        'cogs': int(row['COGS']),
-                        'update': str(row['Update']).strip(),
-                        'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
-                    })
+                for _, row in df[df['code_clean'] == code.upper()].iterrows():
+                    append_cogs_row(row)
 
+        # Tier 1: Phrase match
+        for phrase in phrase_variants:
+            if len(cogs_data) >= MAX_CONTEXT_ROWS:
+                break
+            phrase_mask = df['desc_clean'].str.contains(phrase, na=False, regex=False)
+            for _, row in df[phrase_mask].head(30).iterrows():
+                append_cogs_row(row)
+                if len(cogs_data) >= MAX_CONTEXT_ROWS:
+                    break
+
+        # Tier 2: Per kata (fallback)
         for kw in words[:5]:
             if len(cogs_data) >= MAX_CONTEXT_ROWS:
                 break
             kw_mask = df['desc_clean'].str.contains(kw, na=False, regex=False)
-            for _, row in df[kw_mask].head(15).iterrows():
-                if row['Material Code'] in cogs_found_codes:
-                    continue
-                cogs_found_codes.add(row['Material Code'])
-                nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
-                cogs_data.append({
-                    'code': row['Material Code'],
-                    'desc': str(row['Material Description']).strip(),
-                    'source': str(row['Source']).strip(),
-                    'cogs': int(row['COGS']),
-                    'update': str(row['Update']).strip(),
-                    'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
-                })
+            for _, row in df[kw_mask].head(10).iterrows():
+                append_cogs_row(row)
                 if len(cogs_data) >= MAX_CONTEXT_ROWS:
                     break
 
