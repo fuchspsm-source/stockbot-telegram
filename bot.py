@@ -1,6 +1,6 @@
 """
-StockBot Telegram v3.1 — Inventory, COGS, & AI Assistant
-Deploy ke Railway, baca data dari Google Drive, powered by Claude Sonnet 4.6
+StockBot Telegram v4.0 — Full AI Assistant
+Powered by Claude Sonnet 4.6. All queries handled by AI.
 """
 import os
 import re
@@ -24,6 +24,8 @@ ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 
 WAREHOUSE_COLS = ['ID30', 'ID40']
 CLAUDE_MODEL = 'claude-sonnet-4-5-20250929'
+MAX_TOKENS = 1500
+MAX_CONTEXT_ROWS = 50  # Max data rows kasih ke AI
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -36,24 +38,18 @@ if ANTHROPIC_API_KEY:
     claude_client = Anthropic(api_key=ANTHROPIC_API_KEY)
     logger.info("✅ Claude AI client initialized")
 else:
-    logger.warning("⚠️ ANTHROPIC_API_KEY belum di-set, AI features off")
+    logger.warning("⚠️ ANTHROPIC_API_KEY belum di-set!")
 
 DATA = {
     'stock': None,
     'stock_sheet': None,
     'cogs': None,
     'cogs_sheet': None,
-    'filename': None,
 }
 
-SESSIONS = {}
+# Chat history per user (max 6 turns)
 CHAT_HISTORY = {}
-MAX_HISTORY = 5
-
-COGS_KEYWORDS = {'COGS', 'COST', 'HARGA MODAL', 'MODAL', 'HPP'}
-CLEAR_KEYWORDS = {'STOP', 'CLEAR', 'RESET'}
-NC_PATTERN = re.compile(r'NC\s*(\d+(?:\.\d+)?)\s*%?', re.IGNORECASE)
-PRICE_PATTERN = re.compile(r'JUAL\s*(?:RP\s*)?([\d.,]+)', re.IGNORECASE)
+MAX_HISTORY = 6
 
 
 # ─────────────────────────────────────────────
@@ -61,10 +57,8 @@ PRICE_PATTERN = re.compile(r'JUAL\s*(?:RP\s*)?([\d.,]+)', re.IGNORECASE)
 # ─────────────────────────────────────────────
 def download_from_gdrive(file_id, as_gsheet=False):
     if as_gsheet:
-        # Google Sheets native → export as xlsx
         url = f'https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx'
     else:
-        # Regular file (xlsx upload) → direct download
         url = f'https://drive.google.com/uc?export=download&id={file_id}'
     response = requests.get(url, allow_redirects=True, timeout=60)
     if not as_gsheet and 'confirm=' in response.text:
@@ -77,14 +71,14 @@ def download_from_gdrive(file_id, as_gsheet=False):
 
 def load_stock_data():
     try:
-        logger.info("📥 Downloading STOCK Excel...")
+        logger.info("📥 Loading STOCK...")
         try:
             excel_data = download_from_gdrive(GDRIVE_FILE_ID)
             xl = pd.ExcelFile(excel_data)
         except Exception:
-            logger.info("📥 Retry as Google Sheets export...")
             excel_data = download_from_gdrive(GDRIVE_FILE_ID, as_gsheet=True)
             xl = pd.ExcelFile(excel_data)
+        
         sheets = xl.sheet_names
         if not sheets:
             return False, "File stok tidak punya sheet."
@@ -93,6 +87,14 @@ def load_stock_data():
         cols = list(df.columns)
         if str(cols[0]).strip() == '' or 'Unnamed' in str(cols[0]):
             df = df.rename(columns={cols[0]: 'Material'})
+        
+        # Find Material Code column (kalau ada)
+        code_col = None
+        for col in df.columns:
+            if 'CODE' in str(col).upper() or 'MATERIAL' == str(col).upper().strip():
+                code_col = col
+                break
+        
         for col in WAREHOUSE_COLS:
             if col not in df.columns:
                 df[col] = 0
@@ -100,28 +102,33 @@ def load_stock_data():
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         df['Total'] = df[WAREHOUSE_COLS].sum(axis=1)
         df['desc_clean'] = df['Material Description'].astype(str).str.strip().str.upper()
+        
+        if code_col:
+            df['code_clean'] = df[code_col].astype(str).str.strip().str.upper()
+        else:
+            df['code_clean'] = ''
+        
         DATA['stock'] = df
         DATA['stock_sheet'] = latest_sheet
-        logger.info(f"✅ Loaded STOCK: {len(df)} products from '{latest_sheet}'")
+        logger.info(f"✅ STOCK: {len(df)} products from '{latest_sheet}'")
         return True, f"Stok: sheet '{latest_sheet}', {len(df):,} produk"
     except Exception as e:
         logger.error(f"❌ Stock load error: {e}")
-        return False, f"Error loading stock: {str(e)}"
+        return False, f"Error stock: {str(e)}"
 
 
 def load_cogs_data():
     if not GDRIVE_COGS_FILE_ID:
         return False, "COGS file ID belum di-set."
     try:
-        logger.info("📥 Downloading COGS Excel...")
-        # Try regular Excel first, fallback to Google Sheets export
+        logger.info("📥 Loading COGS...")
         try:
             excel_data = download_from_gdrive(GDRIVE_COGS_FILE_ID)
             xl = pd.ExcelFile(excel_data)
         except Exception:
-            logger.info("📥 Retry as Google Sheets export...")
             excel_data = download_from_gdrive(GDRIVE_COGS_FILE_ID, as_gsheet=True)
             xl = pd.ExcelFile(excel_data)
+        
         sheets = xl.sheet_names
         if not sheets:
             return False, "File COGS tidak punya sheet."
@@ -137,15 +144,14 @@ def load_cogs_data():
         df['code_clean'] = df['Material Code'].str.upper()
         df['source_clean'] = df['Source'].astype(str).str.strip().str.upper()
         df['Rata2 NC Sebelumnya'] = df['Rata2 NC Sebelumnya'].astype(str).str.strip()
-        # Drop hanya row tanpa Material Code (truly empty), simpan COGS=0 untuk produk baru
         df = df[df['Material Code'].notna() & (df['Material Code'] != '') & (df['Material Code'] != 'nan')].reset_index(drop=True)
         DATA['cogs'] = df
         DATA['cogs_sheet'] = latest_sheet
-        logger.info(f"✅ Loaded COGS: {len(df)} entries from '{latest_sheet}'")
+        logger.info(f"✅ COGS: {len(df)} entries from '{latest_sheet}'")
         return True, f"COGS: sheet '{latest_sheet}', {len(df):,} entries"
     except Exception as e:
         logger.error(f"❌ COGS load error: {e}")
-        return False, f"Error loading COGS: {str(e)}"
+        return False, f"Error COGS: {str(e)}"
 
 
 def load_all_data():
@@ -157,393 +163,100 @@ def load_all_data():
 
 
 # ─────────────────────────────────────────────
-# STOCK QUERY
+# SMART DATA FETCHER (untuk AI context)
 # ─────────────────────────────────────────────
-def extract_packaging(text):
-    text = text.upper()
-    match = re.search(r'(\d+(?:\.\d+)?)\s*L\b', text)
-    if match:
-        return match.group(0).replace(' ', '')
-    return None
+COMMON_STOP_WORDS = {
+    'STOK', 'STOCK', 'COGS', 'COST', 'HARGA', 'BERAPA', 'YA', 'DONG',
+    'PRODUK', 'BARANG', 'UNTUK', 'DARI', 'KEMASAN', 'YANG', 'DI',
+    'DAN', 'SEMUA', 'ADA', 'CEK', 'CARI', 'LIHAT', 'TUNJUKKAN',
+    'MODAL', 'HPP', 'JUAL', 'NC', 'BAGAIMANA', 'GIMANA', 'APA',
+    'SAJA', 'MANA', 'LU', 'GW', 'GUE', 'KAMU', 'SAYA', 'AKU',
+    'KAYANYA', 'SALAH', 'DEH', 'COBA', 'TOLONG', 'BISA', 'MAU',
+    'TIDAK', 'GAK', 'NGGAK', 'KOK', 'KAN', 'AJA', 'SIH',
+    'INI', 'ITU', 'KE', 'PADA', 'OLEH', 'JUGA', 'TAPI',
+    'NAMUN', 'JADI', 'ATAU', 'KALAU', 'KALO', 'MISAL', 'CONTOH',
+    'BANYAK', 'SEDIKIT', 'BAGUS', 'JELEK', 'BAIK', 'BURUK',
+    'JIKA', 'BILA', 'AGAR', 'SUPAYA', 'KARENA', 'SEBAB',
+    'BIAR', 'SAMA', 'TERIMA', 'KASIH', 'HALO', 'HAI', 'OK', 'OKE',
+}
 
 
-def answer_analytics(q, df):
-    if any(kw in q for kw in ['PALING BANYAK', 'TERBESAR', 'TERBANYAK', 'TOP', 'HIGHEST']):
-        n = 10
-        match_n = re.search(r'TOP\s*(\d+)', q)
-        if match_n:
-            n = int(match_n.group(1))
-        top = df[df['Total'] > 0].nlargest(n, 'Total')[['Material Description', 'ID30', 'ID40', 'Total']]
-        lines = [f'🏆 *Top {n} Produk Stok Terbanyak:*\n']
-        for i, (_, row) in enumerate(top.iterrows(), 1):
-            desc = str(row['Material Description']).strip()[:50]
-            lines.append(f'{i}. {desc}')
-            lines.append(f'   ID30: {int(row["ID30"]):,} | ID40: {int(row["ID40"]):,} | Total: {int(row["Total"]):,}')
-        return '\n'.join(lines)
-    if any(kw in q for kw in ['PALING SEDIKIT', 'TERKECIL', 'TERENDAH', 'LOWEST']):
-        low = df[df['Total'] > 0].nsmallest(10, 'Total')[['Material Description', 'ID30', 'ID40', 'Total']]
-        lines = ['⚠️ *10 Produk Stok Paling Sedikit (>0):*\n']
-        for i, (_, row) in enumerate(low.iterrows(), 1):
-            desc = str(row['Material Description']).strip()[:50]
-            lines.append(f'{i}. {desc}')
-            lines.append(f'   ID30: {int(row["ID30"]):,} | ID40: {int(row["ID40"]):,} | Total: {int(row["Total"]):,}')
-        return '\n'.join(lines)
-    if any(kw in q for kw in ['KOSONG', 'HABIS', 'ZERO', 'NOL']):
-        zero = df[df['Total'] == 0]
-        return f'🚨 Produk dengan stok 0: *{len(zero):,}* dari total {len(df):,} produk.'
-    if any(kw in q for kw in ['SUMMARY', 'RINGKASAN', 'TOTAL SEMUA', 'REKAP']):
-        total_id30 = int(df['ID30'].sum())
-        total_id40 = int(df['ID40'].sum())
-        nonzero = len(df[df['Total'] > 0])
-        zero = len(df[df['Total'] == 0])
-        return (
-            f'📊 *Ringkasan Stok:*\n\n'
-            f'• Total produk: {len(df):,}\n'
-            f'• Ada stok: {nonzero:,}\n'
-            f'• Kosong: {zero:,}\n\n'
-            f'🏭 ID30 Total: *{total_id30:,}*\n'
-            f'🏭 ID40 Total: *{total_id40:,}*\n'
-            f'✅ GRAND TOTAL: *{total_id30 + total_id40:,}*'
-        )
-    if 'ID30' in q or 'GUDANG 30' in q:
-        top = df[df['ID30'] > 0].nlargest(10, 'ID30')[['Material Description', 'ID30']]
-        lines = ['🏭 *Top 10 Stok di ID30:*\n']
-        for i, (_, row) in enumerate(top.iterrows(), 1):
-            lines.append(f'{i}. {str(row["Material Description"]).strip()[:50]} — {int(row["ID30"]):,}')
-        return '\n'.join(lines)
-    if 'ID40' in q or 'GUDANG 40' in q:
-        top = df[df['ID40'] > 0].nlargest(10, 'ID40')[['Material Description', 'ID40']]
-        lines = ['🏭 *Top 10 Stok di ID40:*\n']
-        for i, (_, row) in enumerate(top.iterrows(), 1):
-            lines.append(f'{i}. {str(row["Material Description"]).strip()[:50]} — {int(row["ID40"]):,}')
-        return '\n'.join(lines)
-    return None
+def extract_keywords(user_input):
+    """Extract keyword penting dari user input."""
+    text = user_input.upper()
+    # Cek angka panjang (Material Code) — prioritas tinggi
+    codes = re.findall(r'\b\d{6,}\b', text)
+    # Word lain (skip stop words)
+    words = [w for w in text.split() if w not in COMMON_STOP_WORDS and len(w) > 2 and not w.isdigit()]
+    # Sort by length desc — kata panjang biasanya nama produk
+    words = sorted(set(words), key=lambda w: -len(w))
+    return codes, words
 
 
-def query_stock(user_input):
-    df = DATA['stock']
-    if df is None:
-        return '⚠️ Data belum ter-load. Coba ketik /reload'
-    q = user_input.upper().strip()
-    pkg = extract_packaging(q)
-    stop_words = {'STOK', 'STOCK', 'ADA', 'BERAPA', 'DI', 'SEMUA', 'GUDANG',
-                  'DAN', 'TOTALNYA', 'TOTAL', 'PRODUK', 'SEKARANG', 'SAAT', 'INI',
-                  'JUMLAH', 'CEK', 'CARI', 'TUNJUKKAN', 'LIHAT'}
-    q_no_pkg = re.sub(r'\d+(?:\.\d+)?\s*L\b', '', q).strip()
-    words = [w for w in q_no_pkg.split() if w not in stop_words and len(w) > 1]
-    if not words:
-        return answer_analytics(q, df)
-    mask = pd.Series([True] * len(df))
-    for kw in words:
-        mask = mask & df['desc_clean'].str.contains(kw, na=False, regex=False)
-    if pkg:
-        pkg_num = re.search(r'\d+', pkg).group()
-        mask = mask & df['desc_clean'].str.contains(pkg_num + 'L', na=False, regex=False)
-    result = df[mask].copy()
-    if result.empty and len(words) > 2:
-        mask2 = pd.Series([True] * len(df))
-        for kw in words[:2]:
-            mask2 = mask2 & df['desc_clean'].str.contains(kw, na=False, regex=False)
-        result = df[mask2].copy()
-    if result.empty:
-        analytics_result = answer_analytics(q, df)
-        return analytics_result
-    lines = [f'📦 *Ditemukan {len(result)} varian:*\n']
-    grand_id30 = 0
-    grand_id40 = 0
-    for _, row in result.iterrows():
-        desc = str(row['Material Description']).strip()
-        id30 = int(row['ID30'])
-        id40 = int(row['ID40'])
-        total = id30 + id40
-        grand_id30 += id30
-        grand_id40 += id40
-        if total > 0:
-            lines.append(f'• {desc}')
-            lines.append(f'   ID30: {id30:,} | ID40: {id40:,} | Sub: {total:,}')
-        else:
-            lines.append(f'• {desc} _(0)_')
-    lines.append('\n─────────────────')
-    lines.append(f'🏭 TOTAL ID30: *{grand_id30:,}*')
-    lines.append(f'🏭 TOTAL ID40: *{grand_id40:,}*')
-    lines.append(f'✅ GRAND TOTAL: *{grand_id30 + grand_id40:,}*')
-    return '\n'.join(lines)
-
-
-# ─────────────────────────────────────────────
-# COGS QUERY
-# ─────────────────────────────────────────────
-def extract_cogs_query(user_input):
-    text = user_input.upper().strip()
-    for kw in COGS_KEYWORDS:
-        text = text.replace(kw, ' ')
-    stop_words = {'BERAPA', 'YA', 'DONG', 'PRODUK', 'BARANG', 'UNTUK', 'CARI', 'KODE', 'CODE'}
-    words = [w for w in text.split() if w not in stop_words and len(w) > 0]
-    return ' '.join(words).strip()
-
-
-def query_cogs(user_input, user_id):
-    df = DATA['cogs']
-    if df is None or len(df) == 0:
-        return '⚠️ Data COGS belum ter-load. Coba ketik /reload'
-    query = extract_cogs_query(user_input)
-    if not query:
-        return '❌ Tolong sebutkan nama produk atau material code.'
-    code_mask = df['code_clean'] == query
-    if code_mask.any():
-        result = df[code_mask].copy()
-    else:
-        words = [w for w in query.split() if len(w) > 1]
-        if not words:
-            return f'❌ Query terlalu pendek: "{user_input}"'
-        mask = pd.Series([True] * len(df))
-        for kw in words:
-            mask = mask & df['desc_clean'].str.contains(kw, na=False, regex=False)
-        result = df[mask].copy()
-        if result.empty and len(words) > 2:
-            mask2 = pd.Series([True] * len(df))
-            for kw in words[:2]:
-                mask2 = mask2 & df['desc_clean'].str.contains(kw, na=False, regex=False)
-            result = df[mask2].copy()
-    if result.empty:
-        return None
-    SESSIONS[user_id] = {
-        'product_query': query,
-        'matches': result.copy()
-    }
-    lines = [f'💰 *COGS — {len(result)} varian ditemukan:*\n']
-    for _, row in result.iterrows():
-        code = row['Material Code']
-        desc = str(row['Material Description']).strip()
-        source = str(row['Source']).strip()
-        cogs = int(row['COGS'])
-        update = str(row['Update']).strip()
-        nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
+def fetch_relevant_data(user_input):
+    """Smart fetch data relevan dengan query user."""
+    codes, words = extract_keywords(user_input)
+    
+    stock_data = []
+    cogs_data = []
+    
+    # Track yang sudah dimasukkan
+    stock_found_idx = set()
+    cogs_found_codes = set()
+    
+    # ─── STOCK ───
+    if DATA['stock'] is not None:
+        df = DATA['stock']
         
-        lines.append(f'• `[{code}]` {desc}')
-        if cogs > 0:
-            lines.append(f'   Source: *{source}* | COGS: *Rp {cogs:,}*')
-        else:
-            lines.append(f'   Source: *{source}* | COGS: _belum ada_')
-        if nc_prev and nc_prev != 'nan' and nc_prev != '' and nc_prev != 'None':
-            lines.append(f'   📊 Rata2 NC Sebelumnya: *{nc_prev}*')
-        lines.append(f'   📅 {update}\n')
-    lines.append('─────────────────')
-    lines.append('💡 Lanjut hitung margin? Ketik misal:')
-    lines.append('   `china nc 30%` atau `local jual 100000`')
-    lines.append('   Ketik `stop` untuk reset.')
-    return '\n'.join(lines)
-
-
-# ─────────────────────────────────────────────
-# CALCULATOR
-# ─────────────────────────────────────────────
-def parse_number(text):
-    cleaned = re.sub(r'[^\d]', '', text)
-    return int(cleaned) if cleaned else 0
-
-
-def calculate_margin(user_input, user_id):
-    session = SESSIONS.get(user_id)
-    if not session:
-        return None
-    matches = session['matches']
-    query_upper = user_input.upper()
-    available_sources = matches['source_clean'].unique().tolist()
-    target_source = None
-    for src in available_sources:
-        if src in query_upper:
-            target_source = src
-            break
-    if not target_source:
-        if len(available_sources) == 1:
-            target_source = available_sources[0]
-        else:
-            sources_list = ', '.join([s.title() for s in available_sources])
-            return (
-                f'⚠️ Tolong sebutkan source-nya.\n'
-                f'Pilihan: *{sources_list}*'
-            )
-    row = matches[matches['source_clean'] == target_source].iloc[0]
-    cogs = int(row['COGS'])
-    desc = str(row['Material Description']).strip()
-    code = row['Material Code']
-    update = str(row['Update']).strip()
-    nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
-    
-    # Guard: COGS belum ada
-    if cogs <= 0:
-        return (
-            f'⚠️ *{desc}* (`[{code}]`)\n'
-            f'Source: *{target_source.title()}*\n\n'
-            f'COGS belum ada di database, tidak bisa hitung margin.\n'
-            f'Update kolom COGS di Google Sheets dulu ya.'
-        )
-    
-    nc_match = NC_PATTERN.search(user_input)
-    price_match = PRICE_PATTERN.search(user_input)
-    
-    # Footer NC sebelumnya
-    nc_footer = ''
-    if nc_prev and nc_prev != 'nan' and nc_prev != '' and nc_prev != 'None':
-        nc_footer = f'\n📊 Rata2 NC Sebelumnya: *{nc_prev}*'
-    
-    if nc_match:
-        nc_percent = float(nc_match.group(1))
-        if nc_percent >= 100:
-            return f'❌ NC harus < 100%. Anda input: {nc_percent}%'
-        nc_decimal = nc_percent / 100
-        harga_jual = cogs / (1 - nc_decimal)
-        return (
-            f'💰 *{desc}*\n'
-            f'`[{code}]` Source: *{target_source.title()}*\n\n'
-            f'• COGS:        Rp {cogs:,}\n'
-            f'• NC Target:   *{nc_percent}%*\n'
-            f'• Harga Jual:  *Rp {int(harga_jual):,}*\n\n'
-            f'📐 Formula: HJ = COGS / (1 - NC%)\n'
-            f'📅 COGS update: {update}'
-            f'{nc_footer}'
-        )
-    elif price_match:
-        harga_jual = parse_number(price_match.group(1))
-        if harga_jual <= 0:
-            return f'❌ Harga jual harus > 0.'
-        nc_value = (harga_jual - cogs) / harga_jual * 100
-        if harga_jual <= cogs:
-            return (
-                f'⚠️ *Harga jual di bawah/sama dengan COGS — RUGI!*\n\n'
-                f'• {desc} ({target_source.title()})\n'
-                f'• COGS:       Rp {cogs:,}\n'
-                f'• Harga Jual: Rp {harga_jual:,}\n'
-                f'• NC:         *{nc_value:.1f}%*\n'
-                f'{nc_footer}'
-            )
-        return (
-            f'💰 *{desc}*\n'
-            f'`[{code}]` Source: *{target_source.title()}*\n\n'
-            f'• COGS:        Rp {cogs:,}\n'
-            f'• Harga Jual:  Rp {harga_jual:,}\n'
-            f'• NC:          *{nc_value:.1f}%*\n\n'
-            f'📐 Formula: NC = (HJ - COGS) / HJ\n'
-            f'📅 COGS update: {update}'
-            f'{nc_footer}'
-        )
-    return None
-
-
-def clear_session(user_id):
-    cleared = False
-    if user_id in SESSIONS:
-        del SESSIONS[user_id]
-        cleared = True
-    if user_id in CHAT_HISTORY:
-        del CHAT_HISTORY[user_id]
-        cleared = True
-    if cleared:
-        return '🔄 Session & chat history di-reset. Silakan tanya yang baru.'
-    return '✅ Tidak ada session aktif.'
-
-
-# ─────────────────────────────────────────────
-# CLAUDE AI HANDLER
-# ─────────────────────────────────────────────
-def build_data_context():
-    context_parts = []
-    if DATA['stock'] is not None:
-        df = DATA['stock']
-        context_parts.append(f"=== DATA STOK (sheet: {DATA['stock_sheet']}) ===")
-        context_parts.append(f"Total produk: {len(df):,}")
-        context_parts.append(f"Warehouse: ID30, ID40")
-        context_parts.append(f"Kolom: Material Description, ID30, ID40, Total")
-        context_parts.append(f"Produk dengan stok > 0: {len(df[df['Total'] > 0]):,}")
-        context_parts.append(f"Produk dengan stok 0: {len(df[df['Total'] == 0]):,}")
-    if DATA['cogs'] is not None:
-        df = DATA['cogs']
-        sources = df['Source'].unique().tolist()
-        context_parts.append(f"\n=== DATA COGS (sheet: {DATA['cogs_sheet']}) ===")
-        context_parts.append(f"Total entries: {len(df):,}")
-        context_parts.append(f"Sources tersedia: {', '.join(sources)}")
-        context_parts.append(f"Kolom: Material Code, Material Description, Source, COGS (IDR), Update, Rata2 NC Sebelumnya")
-    return '\n'.join(context_parts)
-
-
-def search_data_for_ai(user_input):
-    results = {'stock_matches': [], 'cogs_matches': []}
-    query_upper = user_input.upper()
-    stop_words = {'STOK', 'STOCK', 'COGS', 'COST', 'HARGA', 'BERAPA', 'YA', 'DONG',
-                  'PRODUK', 'BARANG', 'UNTUK', 'DARI', 'KEMASAN', 'YANG', 'DI',
-                  'DAN', 'SEMUA', 'ADA', 'CEK', 'CARI', 'LIHAT', 'TUNJUKKAN',
-                  'MODAL', 'HPP', 'JUAL', 'NC', 'BAGAIMANA', 'GIMANA', 'APA',
-                  'SAJA', 'MANA', 'LU', 'GW', 'GUE', 'KAMU', 'SAYA',
-                  'KAYANYA', 'SALAH', 'DEH', 'COBA', 'TOLONG', 'BISA', 'MAU',
-                  'TIDAK', 'GAK', 'NGGAK', 'KOK', 'KAN', 'AJA', 'SIH',
-                  'INI', 'ITU', 'KE', 'DARI', 'PADA', 'OLEH', 'JUGA', 'TAPI',
-                  'NAMUN', 'JADI', 'ATAU', 'KALAU', 'KALO', 'MISAL', 'CONTOH',
-                  'BANYAK', 'SEDIKIT', 'BAGUS', 'JELEK', 'BAIK', 'BURUK'}
-    
-    raw_words = query_upper.split()
-    words = [w for w in raw_words if w not in stop_words and len(w) > 2]
-    
-    # Sort by length desc — kata panjang biasanya lebih unik (nama produk)
-    # Tapi keep order untuk multi-keyword filter
-    if not words:
-        return results
-    
-    # Prioritize: kata panjang dulu (likely produk name)
-    sorted_words = sorted(set(words), key=lambda w: -len(w))[:5]
-    if DATA['stock'] is not None:
-        df = DATA['stock']
-        # Smart search: try kombinasi keyword dari yang paling panjang
-        found_codes = set()
-        for kw in sorted_words:
+        # Tier 1: Match Material Code (kalau column ada)
+        if codes and 'code_clean' in df.columns:
+            for code in codes:
+                code_mask = df['code_clean'] == code.upper()
+                for idx, row in df[code_mask].iterrows():
+                    if idx in stock_found_idx:
+                        continue
+                    stock_found_idx.add(idx)
+                    stock_data.append({
+                        'desc': str(row['Material Description']).strip(),
+                        'code': str(row.get('code_clean', '')),
+                        'ID30': int(row['ID30']),
+                        'ID40': int(row['ID40']),
+                        'Total': int(row['Total'])
+                    })
+        
+        # Tier 2: Match description (per keyword)
+        for kw in words[:5]:
+            if len(stock_data) >= MAX_CONTEXT_ROWS:
+                break
             kw_mask = df['desc_clean'].str.contains(kw, na=False, regex=False)
-            kw_matches = df[kw_mask].head(10)
-            for idx, row in kw_matches.iterrows():
-                if idx in found_codes:
+            for idx, row in df[kw_mask].head(15).iterrows():
+                if idx in stock_found_idx:
                     continue
-                found_codes.add(idx)
-                results['stock_matches'].append({
+                stock_found_idx.add(idx)
+                stock_data.append({
                     'desc': str(row['Material Description']).strip(),
+                    'code': str(row.get('code_clean', '')),
                     'ID30': int(row['ID30']),
                     'ID40': int(row['ID40']),
                     'Total': int(row['Total'])
                 })
-                if len(results['stock_matches']) >= 20:
+                if len(stock_data) >= MAX_CONTEXT_ROWS:
                     break
-            if len(results['stock_matches']) >= 20:
-                break
     
+    # ─── COGS ───
     if DATA['cogs'] is not None:
         df = DATA['cogs']
         
-        # Tier 1: Match Material Code (exact) — kalau ada angka panjang
-        code_candidates = re.findall(r'\b\d{6,}\b', user_input)
-        if code_candidates:
-            code_mask = df['code_clean'].isin([c.upper() for c in code_candidates])
-            code_matches = df[code_mask]
-            for _, row in code_matches.iterrows():
-                nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
-                results['cogs_matches'].append({
-                    'code': row['Material Code'],
-                    'desc': str(row['Material Description']).strip(),
-                    'source': str(row['Source']).strip(),
-                    'cogs': int(row['COGS']),
-                    'update': str(row['Update']).strip(),
-                    'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
-                })
-        
-        # Tier 2: Match per keyword (longest first, individual search)
-        if len(results['cogs_matches']) < 20:
-            found_codes = set(r['code'] for r in results['cogs_matches'])
-            for kw in sorted_words:
-                kw_mask = df['desc_clean'].str.contains(kw, na=False, regex=False)
-                kw_matches = df[kw_mask].head(15)
-                for _, row in kw_matches.iterrows():
-                    if row['Material Code'] in found_codes:
+        # Tier 1: Material Code exact
+        if codes:
+            for code in codes:
+                code_mask = df['code_clean'] == code.upper()
+                for _, row in df[code_mask].iterrows():
+                    if row['Material Code'] in cogs_found_codes:
                         continue
-                    found_codes.add(row['Material Code'])
+                    cogs_found_codes.add(row['Material Code'])
                     nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
-                    results['cogs_matches'].append({
+                    cogs_data.append({
                         'code': row['Material Code'],
                         'desc': str(row['Material Description']).strip(),
                         'source': str(row['Source']).strip(),
@@ -551,120 +264,170 @@ def search_data_for_ai(user_input):
                         'update': str(row['Update']).strip(),
                         'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
                     })
-                    if len(results['cogs_matches']) >= 20:
-                        break
-                if len(results['cogs_matches']) >= 20:
+        
+        # Tier 2: Description match (per keyword)
+        for kw in words[:5]:
+            if len(cogs_data) >= MAX_CONTEXT_ROWS:
+                break
+            kw_mask = df['desc_clean'].str.contains(kw, na=False, regex=False)
+            for _, row in df[kw_mask].head(15).iterrows():
+                if row['Material Code'] in cogs_found_codes:
+                    continue
+                cogs_found_codes.add(row['Material Code'])
+                nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
+                cogs_data.append({
+                    'code': row['Material Code'],
+                    'desc': str(row['Material Description']).strip(),
+                    'source': str(row['Source']).strip(),
+                    'cogs': int(row['COGS']),
+                    'update': str(row['Update']).strip(),
+                    'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
+                })
+                if len(cogs_data) >= MAX_CONTEXT_ROWS:
                     break
     
-    return results
+    return stock_data, cogs_data
+
+
+# ─────────────────────────────────────────────
+# CLAUDE AI HANDLER
+# ─────────────────────────────────────────────
+def get_data_summary():
+    """Summary singkat tentang data yang ada."""
+    parts = []
+    if DATA['stock'] is not None:
+        df = DATA['stock']
+        parts.append(f"STOK: {len(df):,} produk (sheet: {DATA['stock_sheet']}). Warehouse: ID30, ID40.")
+    if DATA['cogs'] is not None:
+        df = DATA['cogs']
+        sources = df['Source'].unique().tolist()
+        parts.append(f"COGS: {len(df):,} entries (sheet: {DATA['cogs_sheet']}). Sources: {', '.join(sources)}.")
+    return ' | '.join(parts)
+
+
+def get_analytics_data():
+    """Pre-compute analytics (top stock, kosong, dll) untuk question analytics."""
+    if DATA['stock'] is None:
+        return {}
+    df = DATA['stock']
+    return {
+        'total_produk': len(df),
+        'stok_kosong': int(len(df[df['Total'] == 0])),
+        'ada_stok': int(len(df[df['Total'] > 0])),
+        'total_id30': int(df['ID30'].sum()),
+        'total_id40': int(df['ID40'].sum()),
+        'grand_total': int(df['Total'].sum()),
+        'top_10_terbanyak': [
+            {'desc': str(row['Material Description']).strip(), 'total': int(row['Total']),
+             'id30': int(row['ID30']), 'id40': int(row['ID40'])}
+            for _, row in df[df['Total'] > 0].nlargest(10, 'Total').iterrows()
+        ],
+        'top_10_tersedikit': [
+            {'desc': str(row['Material Description']).strip(), 'total': int(row['Total']),
+             'id30': int(row['ID30']), 'id40': int(row['ID40'])}
+            for _, row in df[df['Total'] > 0].nsmallest(10, 'Total').iterrows()
+        ],
+    }
 
 
 def ask_claude(user_input, user_id):
+    """Send query to Claude with smart context."""
     if not claude_client:
-        return '⚠️ Fitur AI belum aktif. ANTHROPIC_API_KEY belum di-set.'
+        return '⚠️ Fitur AI belum aktif. Hubungi admin untuk set ANTHROPIC_API_KEY.'
+    
     try:
-        data_context = build_data_context()
-        relevant_data = search_data_for_ai(user_input)
+        # Fetch relevant data
+        stock_data, cogs_data = fetch_relevant_data(user_input)
         
-        system_prompt = f"""Kamu adalah StockBot, asisten AI untuk perusahaan pelumas yang membantu cek inventory dan COGS.
+        # Check kalau pertanyaan analytics (no produk-specific keyword)
+        wants_analytics = any(kw in user_input.upper() for kw in [
+            'PALING', 'TOP', 'REKAP', 'RINGKASAN', 'TOTAL SEMUA',
+            'KOSONG', 'HABIS', 'TERBANYAK', 'TERSEDIKIT'
+        ])
+        
+        analytics = get_analytics_data() if wants_analytics else None
+        
+        data_summary = get_data_summary()
+        
+        # Build context
+        context_parts = [f"DATA SUMMARY: {data_summary}"]
+        
+        if analytics:
+            context_parts.append(f"\nANALYTICS:\n{json.dumps(analytics, indent=2, ensure_ascii=False)}")
+        
+        if stock_data:
+            context_parts.append(f"\nSTOK RELEVAN ({len(stock_data)} hasil):\n{json.dumps(stock_data, indent=2, ensure_ascii=False)}")
+        
+        if cogs_data:
+            context_parts.append(f"\nCOGS RELEVAN ({len(cogs_data)} hasil):\n{json.dumps(cogs_data, indent=2, ensure_ascii=False)}")
+        
+        if not stock_data and not cogs_data and not analytics:
+            context_parts.append("\n(Tidak ada data spesifik yang match. User mungkin tanya hal umum.)")
+        
+        data_context = '\n'.join(context_parts)
+        
+        # System prompt
+        system_prompt = f"""Kamu adalah StockBot, asisten AI untuk perusahaan pelumas. Bantu user dengan inventory, COGS, harga jual, margin (NC), dan analisa bisnis.
 
-PERAN KAMU:
-- Jawab pertanyaan user tentang stok, COGS, harga jual, dan margin
-- Berikan analisa dan rekomendasi bisnis kalau diminta
-- Toleran terhadap typo dan natural language
-- Gunakan Bahasa Indonesia kasual tapi profesional
-- Output ringkas dan jelas (max 200 kata), pakai bullet point dan emoji secukupnya
+ATURAN:
+1. Jawab pakai Bahasa Indonesia kasual tapi profesional.
+2. JANGAN mengarang data — hanya berdasarkan data yang dikasih.
+3. Kalau data tidak match query user, bilang apa adanya & kasih saran cek ejaan/code.
+4. Format angka: pakai pemisah ribuan, contoh Rp 50.000.
+5. Output ringkas (max 250 kata). Pakai bullet point + emoji secukupnya.
+6. Pakai Markdown Telegram: *bold*, `code`.
 
-ATURAN PENTING:
-1. JANGAN mengarang data — hanya jawab berdasarkan data yang saya kasih
-2. Kalau data tidak ada di context, bilang "data tidak ditemukan"
-3. Format angka pakai pemisah ribuan (contoh: Rp 50.000)
-4. Formula NC: (Harga Jual - COGS) / Harga Jual
-5. Formula Harga Jual: COGS / (1 - NC%)
-6. Pakai Markdown Telegram: *bold*, `code`
-7. Kolom "Rata2 NC Sebelumnya" berisi rata-rata NC historis per produk. Gunakan untuk perbandingan atau saran pricing.
+FORMULA:
+- NC% = (Harga Jual - COGS) / Harga Jual × 100
+- Harga Jual = COGS / (1 - NC%/100)
 
-KONTEKS DATA:
+PENTING SOAL MATERIAL CODE:
+- Material code di STOK dan COGS BISA BEDA untuk produk yang sama (karena beda source/supplier).
+- Kalau user kasih kode stok tapi data COGS pakai kode lain, cari COGS by deskripsi produk.
+- 1 produk fisik bisa punya multi-source dengan beda kode (Local, Jerman, China, dll).
+
+CARA KERJA DATA:
+- Kolom STOK: Material Description, code, ID30, ID40, Total.
+- Kolom COGS: code, desc, source, cogs (Rupiah), update = label COGS update terakhir (bukan margin update), rata2_nc_sebelumnya.
+- Sheet COGS paling kanan = paling baru.
+
+DATA KONTEKS:
 {data_context}
-
-DATA RELEVAN DENGAN QUERY USER:
-{json.dumps(relevant_data, indent=2, ensure_ascii=False)}
 """
+        
+        # Chat history
         history = CHAT_HISTORY.get(user_id, [])
         messages = history + [{"role": "user", "content": user_input}]
         
+        # Call Claude
         response = claude_client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=1024,
+            max_tokens=MAX_TOKENS,
             system=system_prompt,
             messages=messages
         )
         reply = response.content[0].text
+        
+        # Save history
         history.append({"role": "user", "content": user_input})
         history.append({"role": "assistant", "content": reply})
         if len(history) > MAX_HISTORY * 2:
             history = history[-(MAX_HISTORY * 2):]
         CHAT_HISTORY[user_id] = history
-        logger.info(f"🤖 Claude reply for {user_id}: {len(reply)} chars")
+        
+        logger.info(f"🤖 Reply ke {user_id}: {len(reply)} chars (stock:{len(stock_data)}, cogs:{len(cogs_data)})")
         return reply
+    
     except Exception as e:
-        logger.error(f"❌ Claude AI error: {e}")
-        return f'⚠️ AI error: {str(e)[:100]}\n\nCoba pertanyaan yang lebih spesifik atau ketik /help'
+        logger.error(f"❌ Claude error: {e}")
+        return f'⚠️ AI error: {str(e)[:150]}\n\nCoba ulangi pertanyaannya atau ketik /reload.'
 
 
-# ─────────────────────────────────────────────
-# SMART ROUTER
-# ─────────────────────────────────────────────
-def is_simple_query(text_upper):
-    simple_patterns = [
-        r'^(STOK|STOCK)\s+\w',
-        r'^(COGS|COST)\s+\w',
-        r'^TOP\s+\d+',
-        r'PALING\s+(BANYAK|SEDIKIT)',
-        r'^REKAP',
-        r'(STOK|PRODUK)\s+KOSONG',
-        r'\b\d{6,}\b',                  # Material Code (>= 6 digit angka)
-        r'^CARI\s+(KODE|CODE)',         # "cari kode XXXXX"
-    ]
-    return any(re.search(p, text_upper) for p in simple_patterns)
-
-
-def route_message(user_input, user_id):
-    text_upper = user_input.upper().strip()
-    
-    if text_upper in CLEAR_KEYWORDS:
-        return clear_session(user_id)
-    
-    if user_id in SESSIONS:
-        has_nc = bool(NC_PATTERN.search(user_input))
-        has_price = bool(PRICE_PATTERN.search(user_input))
-        if has_nc or has_price:
-            result = calculate_margin(user_input, user_id)
-            if result:
-                return result
-    
-    if is_simple_query(text_upper):
-        # Kalau ada Material Code (angka panjang) atau "cari kode" → langsung ke COGS
-        has_code = bool(re.search(r'\b\d{6,}\b', text_upper))
-        if has_code or any(kw in text_upper for kw in COGS_KEYWORDS):
-            result = query_cogs(user_input, user_id)
-            if result:
-                return result
-        result = query_stock(user_input)
-        if result:
-            return result
-    
-    if claude_client:
-        logger.info(f"🤖 Routing to Claude AI: {user_input[:80]}")
-        return ask_claude(user_input, user_id)
-    
-    result = query_stock(user_input)
-    if result:
-        return result
-    return (
-        '🤖 Saya belum mengerti pertanyaan tersebut.\n\n'
-        'Coba ketik /help untuk lihat contoh pertanyaan.'
-    )
+def clear_history(user_id):
+    if user_id in CHAT_HISTORY:
+        del CHAT_HISTORY[user_id]
+        return '🔄 Chat history di-reset. Mulai dari awal lagi!'
+    return '✅ Tidak ada history aktif.'
 
 
 # ─────────────────────────────────────────────
@@ -682,20 +445,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(user_id):
         await update.message.reply_text(f'❌ Akses ditolak.\nUser ID: `{user_id}`', parse_mode='Markdown')
         return
-    ai_status = '🤖 AI aktif (Claude Sonnet)' if claude_client else '⚠️ AI off'
+    ai_status = '🤖 Full AI Mode' if claude_client else '⚠️ AI off'
     msg = (
-        '👋 *Halo! Selamat datang di StockBot v3.1*\n\n'
+        '👋 *Halo! StockBot v4.0 (Full AI)*\n\n'
         f'{ai_status}\n\n'
-        'Saya bisa bantu:\n'
-        '• Cek stok inventory\n'
-        '• Cek COGS produk\n'
-        '• Hitung margin (NC)\n'
-        '• Analisa & rekomendasi bisnis\n\n'
+        'Saya dijalankan oleh Claude Sonnet 4.6.\n'
+        'Tanya saya apa aja — natural language, casual, complex — semua OK!\n\n'
+        '*Contoh:*\n'
+        '• Cek stok ceplattyn\n'
+        '• Berapa cost titan plus 205L dari local?\n'
+        '• Hitung harga jual kalau NC 30%\n'
+        '• Bandingkan margin titan vs ceplattyn\n'
+        '• Saran restock produk apa minggu depan?\n\n'
         '*Commands:*\n'
         '/reload — refresh data\n'
         '/status — info data\n'
-        '/help — bantuan\n\n'
-        'Coba tanya saya apa saja!'
+        '/clear — reset chat history'
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -704,25 +469,22 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     msg = (
-        '📖 *Bantuan StockBot v3.1:*\n\n'
-        '━━━ *FITUR STOK* ━━━\n'
-        '`stok titan truck plus 205L`\n'
-        '`top 20 stok terbanyak`\n'
-        '`rekap total stok`\n'
-        '`top 10 stok di ID30`\n\n'
-        '━━━ *FITUR COGS* ━━━\n'
-        '`cogs ceplattyn sf 30`\n'
-        '`cogs 10234` (material code)\n'
-        '`china nc 30%` (hitung harga jual)\n'
-        '`local jual 100000` (hitung NC)\n\n'
-        '━━━ *FITUR AI* 🤖 ━━━\n'
-        'Tanya bebas dalam bahasa natural:\n'
-        '• "harga ceplattyn sf 30 205L dari china?"\n'
-        '• "produk mana paling profitable?"\n'
-        '• "kasih saran restock minggu depan"\n'
-        '• "bandingin titan vs ceplattyn"\n\n'
-        '━━━ *RESET* ━━━\n'
-        '`stop` / `clear` / `reset`'
+        '📖 *StockBot v4.0 — Bantuan*\n\n'
+        '🤖 Bot ini powered by Claude AI. Tanya apa aja!\n\n'
+        '*Yang bisa ditanya:*\n'
+        '• Cek stok produk\n'
+        '• Cek COGS (semua source)\n'
+        '• Hitung NC / harga jual\n'
+        '• Analisa & rekomendasi\n'
+        '• Bandingkan produk\n\n'
+        '*Tips:*\n'
+        '• Bot ingat percakapan sebelumnya\n'
+        '• Ketik `/clear` untuk reset history\n'
+        '• Material code di STOK & COGS bisa beda, bot otomatis match by nama\n\n'
+        '*Commands:*\n'
+        '/reload — refresh data dari Google Drive\n'
+        '/status — info data ter-load\n'
+        '/clear — reset chat history'
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -761,15 +523,21 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f'   • Jumlah source: {sources}')
     lines.append('')
     if claude_client:
-        lines.append('🤖 *AI:* Claude Sonnet 4.6 aktif')
+        lines.append('🤖 *AI:* Claude Sonnet 4.6 (FULL MODE)')
     else:
-        lines.append('⚠️ *AI:* off (set ANTHROPIC_API_KEY)')
+        lines.append('⚠️ *AI:* off')
     user_id = update.effective_user.id
-    if user_id in SESSIONS:
-        lines.append(f'\n💬 *Session COGS:* `{SESSIONS[user_id]["product_query"]}`')
     if user_id in CHAT_HISTORY:
-        lines.append(f'💬 *Chat history:* {len(CHAT_HISTORY[user_id])//2} turn')
+        lines.append(f'\n💬 *Chat history:* {len(CHAT_HISTORY[user_id])//2} turn')
     await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
+
+
+async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = update.effective_user.id
+    reply = clear_history(user_id)
+    await update.message.reply_text(reply)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -779,8 +547,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_text = update.message.text
     logger.info(f"Query from {user_id}: {user_text}")
+    
+    # Typing indicator
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-    reply = route_message(user_text, user_id)
+    
+    # Quick reset commands (non-slash)
+    if user_text.upper().strip() in ['STOP', 'CLEAR', 'RESET']:
+        reply = clear_history(user_id)
+        await update.message.reply_text(reply)
+        return
+    
+    # ALL queries → Claude AI
+    reply = ask_claude(user_text, user_id)
+    
     if len(reply) > 4000:
         chunks = [reply[i:i+4000] for i in range(0, len(reply), 4000)]
         for chunk in chunks:
@@ -806,11 +585,12 @@ def main():
         logger.error("❌ GDRIVE_FILE_ID tidak di-set!")
         return
     if not GDRIVE_COGS_FILE_ID:
-        logger.warning("⚠️ GDRIVE_COGS_FILE_ID belum di-set — fitur COGS off.")
+        logger.warning("⚠️ GDRIVE_COGS_FILE_ID belum di-set.")
     if not ANTHROPIC_API_KEY:
-        logger.warning("⚠️ ANTHROPIC_API_KEY belum di-set — fitur AI off.")
+        logger.error("❌ ANTHROPIC_API_KEY tidak di-set! Bot v4.0 butuh AI.")
+        return
     
-    logger.info("🚀 Starting StockBot v3.1 (with AI + NC History)...")
+    logger.info("🚀 Starting StockBot v4.0 (Full AI Mode)...")
     success, msg = load_all_data()
     logger.info(f"Initial load:\n{msg}")
     
@@ -819,9 +599,10 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    logger.info("✅ Bot is running with AI...")
+    logger.info("✅ Bot running with FULL AI...")
     app.run_polling(drop_pending_updates=True)
 
 
