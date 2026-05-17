@@ -59,10 +59,15 @@ PRICE_PATTERN = re.compile(r'JUAL\s*(?:RP\s*)?([\d.,]+)', re.IGNORECASE)
 # ─────────────────────────────────────────────
 # GOOGLE DRIVE LOADER
 # ─────────────────────────────────────────────
-def download_from_gdrive(file_id):
-    url = f'https://drive.google.com/uc?export=download&id={file_id}'
+def download_from_gdrive(file_id, as_gsheet=False):
+    if as_gsheet:
+        # Google Sheets native → export as xlsx
+        url = f'https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx'
+    else:
+        # Regular file (xlsx upload) → direct download
+        url = f'https://drive.google.com/uc?export=download&id={file_id}'
     response = requests.get(url, allow_redirects=True, timeout=60)
-    if 'confirm=' in response.text:
+    if not as_gsheet and 'confirm=' in response.text:
         match = re.search(r'confirm=([0-9A-Za-z_]+)', response.text)
         if match:
             url = f'https://drive.google.com/uc?export=download&confirm={match.group(1)}&id={file_id}'
@@ -73,8 +78,13 @@ def download_from_gdrive(file_id):
 def load_stock_data():
     try:
         logger.info("📥 Downloading STOCK Excel...")
-        excel_data = download_from_gdrive(GDRIVE_FILE_ID)
-        xl = pd.ExcelFile(excel_data)
+        try:
+            excel_data = download_from_gdrive(GDRIVE_FILE_ID)
+            xl = pd.ExcelFile(excel_data)
+        except Exception:
+            logger.info("📥 Retry as Google Sheets export...")
+            excel_data = download_from_gdrive(GDRIVE_FILE_ID, as_gsheet=True)
+            xl = pd.ExcelFile(excel_data)
         sheets = xl.sheet_names
         if not sheets:
             return False, "File stok tidak punya sheet."
@@ -104,8 +114,14 @@ def load_cogs_data():
         return False, "COGS file ID belum di-set."
     try:
         logger.info("📥 Downloading COGS Excel...")
-        excel_data = download_from_gdrive(GDRIVE_COGS_FILE_ID)
-        xl = pd.ExcelFile(excel_data)
+        # Try regular Excel first, fallback to Google Sheets export
+        try:
+            excel_data = download_from_gdrive(GDRIVE_COGS_FILE_ID)
+            xl = pd.ExcelFile(excel_data)
+        except Exception:
+            logger.info("📥 Retry as Google Sheets export...")
+            excel_data = download_from_gdrive(GDRIVE_COGS_FILE_ID, as_gsheet=True)
+            xl = pd.ExcelFile(excel_data)
         sheets = xl.sheet_names
         if not sheets:
             return False, "File COGS tidak punya sheet."
@@ -121,7 +137,8 @@ def load_cogs_data():
         df['code_clean'] = df['Material Code'].str.upper()
         df['source_clean'] = df['Source'].astype(str).str.strip().str.upper()
         df['Rata2 NC Sebelumnya'] = df['Rata2 NC Sebelumnya'].astype(str).str.strip()
-        df = df[df['COGS'] > 0].reset_index(drop=True)
+        # Drop hanya row tanpa Material Code (truly empty), simpan COGS=0 untuk produk baru
+        df = df[df['Material Code'].notna() & (df['Material Code'] != '') & (df['Material Code'] != 'nan')].reset_index(drop=True)
         DATA['cogs'] = df
         DATA['cogs_sheet'] = latest_sheet
         logger.info(f"✅ Loaded COGS: {len(df)} entries from '{latest_sheet}'")
@@ -304,7 +321,10 @@ def query_cogs(user_input, user_id):
         nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
         
         lines.append(f'• `[{code}]` {desc}')
-        lines.append(f'   Source: *{source}* | COGS: *Rp {cogs:,}*')
+        if cogs > 0:
+            lines.append(f'   Source: *{source}* | COGS: *Rp {cogs:,}*')
+        else:
+            lines.append(f'   Source: *{source}* | COGS: _belum ada_')
         if nc_prev and nc_prev != 'nan' and nc_prev != '' and nc_prev != 'None':
             lines.append(f'   📊 Rata2 NC Sebelumnya: *{nc_prev}*')
         lines.append(f'   📅 {update}\n')
@@ -350,6 +370,16 @@ def calculate_margin(user_input, user_id):
     code = row['Material Code']
     update = str(row['Update']).strip()
     nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
+    
+    # Guard: COGS belum ada
+    if cogs <= 0:
+        return (
+            f'⚠️ *{desc}* (`[{code}]`)\n'
+            f'Source: *{target_source.title()}*\n\n'
+            f'COGS belum ada di database, tidak bisa hitung margin.\n'
+            f'Update kolom COGS di Google Sheets dulu ya.'
+        )
+    
     nc_match = NC_PATTERN.search(user_input)
     price_match = PRICE_PATTERN.search(user_input)
     
