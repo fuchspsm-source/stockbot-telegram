@@ -1,5 +1,5 @@
 """
-StockBot Telegram v3 — Inventory, COGS, & AI Assistant
+StockBot Telegram v3.1 — Inventory, COGS, & AI Assistant
 Deploy ke Railway, baca data dari Google Drive, powered by Claude Sonnet 4.6
 """
 import os
@@ -14,7 +14,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from anthropic import Anthropic
 
 # ─────────────────────────────────────────────
-# CONFIG — diisi via Environment Variables di Railway
+# CONFIG
 # ─────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 GDRIVE_FILE_ID = os.environ.get('GDRIVE_FILE_ID', '')
@@ -25,14 +25,12 @@ ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 WAREHOUSE_COLS = ['ID30', 'ID40']
 CLAUDE_MODEL = 'claude-sonnet-4-5-20250929'
 
-# Setup logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Claude client
 claude_client = None
 if ANTHROPIC_API_KEY:
     claude_client = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -40,7 +38,6 @@ if ANTHROPIC_API_KEY:
 else:
     logger.warning("⚠️ ANTHROPIC_API_KEY belum di-set, AI features off")
 
-# Global cache
 DATA = {
     'stock': None,
     'stock_sheet': None,
@@ -114,7 +111,7 @@ def load_cogs_data():
             return False, "File COGS tidak punya sheet."
         latest_sheet = sheets[-1]
         df = pd.read_excel(excel_data, sheet_name=latest_sheet)
-        required = ['Material Code', 'Material Description', 'Source', 'COGS', 'Update']
+        required = ['Material Code', 'Material Description', 'Source', 'COGS', 'Update', 'Rata2 NC Sebelumnya']
         missing = [c for c in required if c not in df.columns]
         if missing:
             return False, f"Kolom COGS missing: {missing}"
@@ -123,6 +120,7 @@ def load_cogs_data():
         df['desc_clean'] = df['Material Description'].astype(str).str.strip().str.upper()
         df['code_clean'] = df['Material Code'].str.upper()
         df['source_clean'] = df['Source'].astype(str).str.strip().str.upper()
+        df['Rata2 NC Sebelumnya'] = df['Rata2 NC Sebelumnya'].astype(str).str.strip()
         df = df[df['COGS'] > 0].reset_index(drop=True)
         DATA['cogs'] = df
         DATA['cogs_sheet'] = latest_sheet
@@ -303,8 +301,12 @@ def query_cogs(user_input, user_id):
         source = str(row['Source']).strip()
         cogs = int(row['COGS'])
         update = str(row['Update']).strip()
+        nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
+        
         lines.append(f'• `[{code}]` {desc}')
         lines.append(f'   Source: *{source}* | COGS: *Rp {cogs:,}*')
+        if nc_prev and nc_prev != 'nan' and nc_prev != '' and nc_prev != 'None':
+            lines.append(f'   📊 Rata2 NC Sebelumnya: *{nc_prev}*')
         lines.append(f'   📅 {update}\n')
     lines.append('─────────────────')
     lines.append('💡 Lanjut hitung margin? Ketik misal:')
@@ -347,8 +349,15 @@ def calculate_margin(user_input, user_id):
     desc = str(row['Material Description']).strip()
     code = row['Material Code']
     update = str(row['Update']).strip()
+    nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
     nc_match = NC_PATTERN.search(user_input)
     price_match = PRICE_PATTERN.search(user_input)
+    
+    # Footer NC sebelumnya
+    nc_footer = ''
+    if nc_prev and nc_prev != 'nan' and nc_prev != '' and nc_prev != 'None':
+        nc_footer = f'\n📊 Rata2 NC Sebelumnya: *{nc_prev}*'
+    
     if nc_match:
         nc_percent = float(nc_match.group(1))
         if nc_percent >= 100:
@@ -363,6 +372,7 @@ def calculate_margin(user_input, user_id):
             f'• Harga Jual:  *Rp {int(harga_jual):,}*\n\n'
             f'📐 Formula: HJ = COGS / (1 - NC%)\n'
             f'📅 COGS update: {update}'
+            f'{nc_footer}'
         )
     elif price_match:
         harga_jual = parse_number(price_match.group(1))
@@ -376,6 +386,7 @@ def calculate_margin(user_input, user_id):
                 f'• COGS:       Rp {cogs:,}\n'
                 f'• Harga Jual: Rp {harga_jual:,}\n'
                 f'• NC:         *{nc_value:.1f}%*\n'
+                f'{nc_footer}'
             )
         return (
             f'💰 *{desc}*\n'
@@ -385,6 +396,7 @@ def calculate_margin(user_input, user_id):
             f'• NC:          *{nc_value:.1f}%*\n\n'
             f'📐 Formula: NC = (HJ - COGS) / HJ\n'
             f'📅 COGS update: {update}'
+            f'{nc_footer}'
         )
     return None
 
@@ -406,7 +418,6 @@ def clear_session(user_id):
 # CLAUDE AI HANDLER
 # ─────────────────────────────────────────────
 def build_data_context():
-    """Bangun context ringkas tentang data."""
     context_parts = []
     if DATA['stock'] is not None:
         df = DATA['stock']
@@ -422,12 +433,11 @@ def build_data_context():
         context_parts.append(f"\n=== DATA COGS (sheet: {DATA['cogs_sheet']}) ===")
         context_parts.append(f"Total entries: {len(df):,}")
         context_parts.append(f"Sources tersedia: {', '.join(sources)}")
-        context_parts.append(f"Kolom: Material Code, Material Description, Source, COGS (IDR), Update")
+        context_parts.append(f"Kolom: Material Code, Material Description, Source, COGS (IDR), Update, Rata2 NC Sebelumnya")
     return '\n'.join(context_parts)
 
 
 def search_data_for_ai(user_input):
-    """Pre-fetch data relevan dengan query untuk dikasih ke AI."""
     results = {'stock_matches': [], 'cogs_matches': []}
     query_upper = user_input.upper()
     stop_words = {'STOK', 'STOCK', 'COGS', 'COST', 'HARGA', 'BERAPA', 'YA', 'DONG',
@@ -458,18 +468,19 @@ def search_data_for_ai(user_input):
             mask = mask & df['desc_clean'].str.contains(kw, na=False, regex=False)
         matches = df[mask].head(20)
         for _, row in matches.iterrows():
+            nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
             results['cogs_matches'].append({
                 'code': row['Material Code'],
                 'desc': str(row['Material Description']).strip(),
                 'source': str(row['Source']).strip(),
                 'cogs': int(row['COGS']),
-                'update': str(row['Update']).strip()
+                'update': str(row['Update']).strip(),
+                'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
             })
     return results
 
 
 def ask_claude(user_input, user_id):
-    """Kirim pertanyaan ke Claude."""
     if not claude_client:
         return '⚠️ Fitur AI belum aktif. ANTHROPIC_API_KEY belum di-set.'
     try:
@@ -492,6 +503,7 @@ ATURAN PENTING:
 4. Formula NC: (Harga Jual - COGS) / Harga Jual
 5. Formula Harga Jual: COGS / (1 - NC%)
 6. Pakai Markdown Telegram: *bold*, `code`
+7. Kolom "Rata2 NC Sebelumnya" berisi rata-rata NC historis per produk. Gunakan untuk perbandingan atau saran pricing.
 
 KONTEKS DATA:
 {data_context}
@@ -525,7 +537,6 @@ DATA RELEVAN DENGAN QUERY USER:
 # SMART ROUTER
 # ─────────────────────────────────────────────
 def is_simple_query(text_upper):
-    """Detect apakah query bisa di-handle pakai kode existing."""
     simple_patterns = [
         r'^(STOK|STOCK)\s+\w',
         r'^(COGS|COST)\s+\w',
@@ -538,14 +549,11 @@ def is_simple_query(text_upper):
 
 
 def route_message(user_input, user_id):
-    """Smart router: decide kode vs AI."""
     text_upper = user_input.upper().strip()
     
-    # Priority 1: Clear session
     if text_upper in CLEAR_KEYWORDS:
         return clear_session(user_id)
     
-    # Priority 2: Session aktif + NC/jual → kalkulasi
     if user_id in SESSIONS:
         has_nc = bool(NC_PATTERN.search(user_input))
         has_price = bool(PRICE_PATTERN.search(user_input))
@@ -554,7 +562,6 @@ def route_message(user_input, user_id):
             if result:
                 return result
     
-    # Priority 3: Simple query → try kode
     if is_simple_query(text_upper):
         if any(kw in text_upper for kw in COGS_KEYWORDS):
             result = query_cogs(user_input, user_id)
@@ -564,12 +571,10 @@ def route_message(user_input, user_id):
         if result:
             return result
     
-    # Priority 4: Fallback ke AI
     if claude_client:
         logger.info(f"🤖 Routing to Claude AI: {user_input[:80]}")
         return ask_claude(user_input, user_id)
     
-    # Last resort
     result = query_stock(user_input)
     if result:
         return result
@@ -596,7 +601,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     ai_status = '🤖 AI aktif (Claude Sonnet)' if claude_client else '⚠️ AI off'
     msg = (
-        '👋 *Halo! Selamat datang di StockBot v3.*\n\n'
+        '👋 *Halo! Selamat datang di StockBot v3.1*\n\n'
         f'{ai_status}\n\n'
         'Saya bisa bantu:\n'
         '• Cek stok inventory\n'
@@ -616,7 +621,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     msg = (
-        '📖 *Bantuan StockBot v3:*\n\n'
+        '📖 *Bantuan StockBot v3.1:*\n\n'
         '━━━ *FITUR STOK* ━━━\n'
         '`stok titan truck plus 205L`\n'
         '`top 20 stok terbanyak`\n'
@@ -722,7 +727,7 @@ def main():
     if not ANTHROPIC_API_KEY:
         logger.warning("⚠️ ANTHROPIC_API_KEY belum di-set — fitur AI off.")
     
-    logger.info("🚀 Starting StockBot v3 (with AI)...")
+    logger.info("🚀 Starting StockBot v3.1 (with AI + NC History)...")
     success, msg = load_all_data()
     logger.info(f"Initial load:\n{msg}")
     
