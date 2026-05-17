@@ -1,6 +1,6 @@
 """
-StockBot Telegram v4.0 — Full AI Assistant
-Powered by Claude Sonnet 4.6. All queries handled by AI.
+StockBot Telegram v4.1 — Full AI Assistant
+Powered by Gemini Flash. All queries handled by AI.
 """
 import os
 import re
@@ -11,7 +11,7 @@ import pandas as pd
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from anthropic import Anthropic
+import google.generativeai as genai
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -20,10 +20,10 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 GDRIVE_FILE_ID = os.environ.get('GDRIVE_FILE_ID', '')
 GDRIVE_COGS_FILE_ID = os.environ.get('GDRIVE_COGS_FILE_ID', '')
 ALLOWED_USER_IDS = os.environ.get('ALLOWED_USER_IDS', '')
-ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 
 WAREHOUSE_COLS = ['ID30', 'ID40']
-CLAUDE_MODEL = 'claude-sonnet-4-5-20250929'
+GEMINI_MODEL = 'gemini-2.0-flash'
 MAX_TOKENS = 1500
 MAX_CONTEXT_ROWS = 50  # Max data rows kasih ke AI
 
@@ -33,12 +33,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-claude_client = None
-if ANTHROPIC_API_KEY:
-    claude_client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    logger.info("✅ Claude AI client initialized")
+gemini_model = None
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+    logger.info("✅ Gemini AI client initialized")
 else:
-    logger.warning("⚠️ ANTHROPIC_API_KEY belum di-set!")
+    logger.warning("⚠️ GEMINI_API_KEY belum di-set!")
 
 DATA = {
     'stock': None,
@@ -78,7 +79,7 @@ def load_stock_data():
         except Exception:
             excel_data = download_from_gdrive(GDRIVE_FILE_ID, as_gsheet=True)
             xl = pd.ExcelFile(excel_data)
-        
+
         sheets = xl.sheet_names
         if not sheets:
             return False, "File stok tidak punya sheet."
@@ -87,14 +88,13 @@ def load_stock_data():
         cols = list(df.columns)
         if str(cols[0]).strip() == '' or 'Unnamed' in str(cols[0]):
             df = df.rename(columns={cols[0]: 'Material'})
-        
-        # Find Material Code column (kalau ada)
+
         code_col = None
         for col in df.columns:
             if 'CODE' in str(col).upper() or 'MATERIAL' == str(col).upper().strip():
                 code_col = col
                 break
-        
+
         for col in WAREHOUSE_COLS:
             if col not in df.columns:
                 df[col] = 0
@@ -102,12 +102,12 @@ def load_stock_data():
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         df['Total'] = df[WAREHOUSE_COLS].sum(axis=1)
         df['desc_clean'] = df['Material Description'].astype(str).str.strip().str.upper()
-        
+
         if code_col:
             df['code_clean'] = df[code_col].astype(str).str.strip().str.upper()
         else:
             df['code_clean'] = ''
-        
+
         DATA['stock'] = df
         DATA['stock_sheet'] = latest_sheet
         logger.info(f"✅ STOCK: {len(df)} products from '{latest_sheet}'")
@@ -128,7 +128,7 @@ def load_cogs_data():
         except Exception:
             excel_data = download_from_gdrive(GDRIVE_COGS_FILE_ID, as_gsheet=True)
             xl = pd.ExcelFile(excel_data)
-        
+
         sheets = xl.sheet_names
         if not sheets:
             return False, "File COGS tidak punya sheet."
@@ -184,11 +184,8 @@ COMMON_STOP_WORDS = {
 def extract_keywords(user_input):
     """Extract keyword penting dari user input."""
     text = user_input.upper()
-    # Cek angka panjang (Material Code) — prioritas tinggi
     codes = re.findall(r'\b\d{6,}\b', text)
-    # Word lain (skip stop words)
     words = [w for w in text.split() if w not in COMMON_STOP_WORDS and len(w) > 2 and not w.isdigit()]
-    # Sort by length desc — kata panjang biasanya nama produk
     words = sorted(set(words), key=lambda w: -len(w))
     return codes, words
 
@@ -196,19 +193,16 @@ def extract_keywords(user_input):
 def fetch_relevant_data(user_input):
     """Smart fetch data relevan dengan query user."""
     codes, words = extract_keywords(user_input)
-    
+
     stock_data = []
     cogs_data = []
-    
-    # Track yang sudah dimasukkan
     stock_found_idx = set()
     cogs_found_codes = set()
-    
+
     # ─── STOCK ───
     if DATA['stock'] is not None:
         df = DATA['stock']
-        
-        # Tier 1: Match Material Code (kalau column ada)
+
         if codes and 'code_clean' in df.columns:
             for code in codes:
                 code_mask = df['code_clean'] == code.upper()
@@ -223,8 +217,7 @@ def fetch_relevant_data(user_input):
                         'ID40': int(row['ID40']),
                         'Total': int(row['Total'])
                     })
-        
-        # Tier 2: Match description (per keyword)
+
         for kw in words[:5]:
             if len(stock_data) >= MAX_CONTEXT_ROWS:
                 break
@@ -242,12 +235,11 @@ def fetch_relevant_data(user_input):
                 })
                 if len(stock_data) >= MAX_CONTEXT_ROWS:
                     break
-    
+
     # ─── COGS ───
     if DATA['cogs'] is not None:
         df = DATA['cogs']
-        
-        # Tier 1: Material Code exact
+
         if codes:
             for code in codes:
                 code_mask = df['code_clean'] == code.upper()
@@ -264,8 +256,7 @@ def fetch_relevant_data(user_input):
                         'update': str(row['Update']).strip(),
                         'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
                     })
-        
-        # Tier 2: Description match (per keyword)
+
         for kw in words[:5]:
             if len(cogs_data) >= MAX_CONTEXT_ROWS:
                 break
@@ -285,12 +276,12 @@ def fetch_relevant_data(user_input):
                 })
                 if len(cogs_data) >= MAX_CONTEXT_ROWS:
                     break
-    
+
     return stock_data, cogs_data
 
 
 # ─────────────────────────────────────────────
-# CLAUDE AI HANDLER
+# GEMINI AI HANDLER
 # ─────────────────────────────────────────────
 def get_data_summary():
     """Summary singkat tentang data yang ada."""
@@ -306,7 +297,7 @@ def get_data_summary():
 
 
 def get_analytics_data():
-    """Pre-compute analytics (top stock, kosong, dll) untuk question analytics."""
+    """Pre-compute analytics untuk question analytics."""
     if DATA['stock'] is None:
         return {}
     df = DATA['stock']
@@ -330,44 +321,8 @@ def get_analytics_data():
     }
 
 
-def ask_claude(user_input, user_id):
-    """Send query to Claude with smart context."""
-    if not claude_client:
-        return '⚠️ Fitur AI belum aktif. Hubungi admin untuk set ANTHROPIC_API_KEY.'
-    
-    try:
-        # Fetch relevant data
-        stock_data, cogs_data = fetch_relevant_data(user_input)
-        
-        # Check kalau pertanyaan analytics (no produk-specific keyword)
-        wants_analytics = any(kw in user_input.upper() for kw in [
-            'PALING', 'TOP', 'REKAP', 'RINGKASAN', 'TOTAL SEMUA',
-            'KOSONG', 'HABIS', 'TERBANYAK', 'TERSEDIKIT'
-        ])
-        
-        analytics = get_analytics_data() if wants_analytics else None
-        
-        data_summary = get_data_summary()
-        
-        # Build context
-        context_parts = [f"DATA SUMMARY: {data_summary}"]
-        
-        if analytics:
-            context_parts.append(f"\nANALYTICS:\n{json.dumps(analytics, indent=2, ensure_ascii=False)}")
-        
-        if stock_data:
-            context_parts.append(f"\nSTOK RELEVAN ({len(stock_data)} hasil):\n{json.dumps(stock_data, indent=2, ensure_ascii=False)}")
-        
-        if cogs_data:
-            context_parts.append(f"\nCOGS RELEVAN ({len(cogs_data)} hasil):\n{json.dumps(cogs_data, indent=2, ensure_ascii=False)}")
-        
-        if not stock_data and not cogs_data and not analytics:
-            context_parts.append("\n(Tidak ada data spesifik yang match. User mungkin tanya hal umum.)")
-        
-        data_context = '\n'.join(context_parts)
-        
-        # System prompt
-        system_prompt = f"""Kamu adalah StockBot, asisten AI untuk perusahaan pelumas. Bantu user dengan inventory, COGS, harga jual, margin (NC), dan analisa bisnis.
+def build_system_prompt(data_context):
+    return f"""Kamu adalah StockBot, asisten AI untuk perusahaan pelumas. Bantu user dengan inventory, COGS, harga jual, margin (NC), dan analisa bisnis.
 
 ATURAN:
 1. Jawab pakai Bahasa Indonesia kasual tapi profesional.
@@ -392,34 +347,72 @@ CARA KERJA DATA:
 - Sheet COGS paling kanan = paling baru.
 
 DATA KONTEKS:
-{data_context}
-"""
-        
-        # Chat history
+{data_context}"""
+
+
+def ask_gemini(user_input, user_id):
+    """Send query to Gemini with smart context."""
+    if not gemini_model:
+        return '⚠️ Fitur AI belum aktif. Hubungi admin untuk set GEMINI_API_KEY.'
+
+    try:
+        # Fetch relevant data
+        stock_data, cogs_data = fetch_relevant_data(user_input)
+
+        wants_analytics = any(kw in user_input.upper() for kw in [
+            'PALING', 'TOP', 'REKAP', 'RINGKASAN', 'TOTAL SEMUA',
+            'KOSONG', 'HABIS', 'TERBANYAK', 'TERSEDIKIT'
+        ])
+
+        analytics = get_analytics_data() if wants_analytics else None
+        data_summary = get_data_summary()
+
+        # Build context
+        context_parts = [f"DATA SUMMARY: {data_summary}"]
+        if analytics:
+            context_parts.append(f"\nANALYTICS:\n{json.dumps(analytics, indent=2, ensure_ascii=False)}")
+        if stock_data:
+            context_parts.append(f"\nSTOK RELEVAN ({len(stock_data)} hasil):\n{json.dumps(stock_data, indent=2, ensure_ascii=False)}")
+        if cogs_data:
+            context_parts.append(f"\nCOGS RELEVAN ({len(cogs_data)} hasil):\n{json.dumps(cogs_data, indent=2, ensure_ascii=False)}")
+        if not stock_data and not cogs_data and not analytics:
+            context_parts.append("\n(Tidak ada data spesifik yang match. User mungkin tanya hal umum.)")
+
+        data_context = '\n'.join(context_parts)
+        system_prompt = build_system_prompt(data_context)
+
+        # Build chat history untuk Gemini format
+        # Gemini pakai format: [{"role": "user"/"model", "parts": [{"text": "..."}]}]
         history = CHAT_HISTORY.get(user_id, [])
-        messages = history + [{"role": "user", "content": user_input}]
-        
-        # Call Claude
-        response = claude_client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=MAX_TOKENS,
-            system=system_prompt,
-            messages=messages
+        gemini_history = []
+        for msg in history:
+            role = "model" if msg["role"] == "assistant" else "user"
+            gemini_history.append({"role": role, "parts": [{"text": msg["content"]}]})
+
+        # Start chat session dengan history
+        chat = gemini_model.start_chat(history=gemini_history)
+
+        # Gabungkan system prompt + user input (Gemini Flash tidak punya system role terpisah)
+        full_prompt = f"{system_prompt}\n\n---\nPertanyaan user: {user_input}"
+
+        response = chat.send_message(
+            full_prompt,
+            generation_config=genai.GenerationConfig(max_output_tokens=MAX_TOKENS)
         )
-        reply = response.content[0].text
-        
-        # Save history
+        reply = response.text
+
+        # Save history (simpan format asli, bukan Gemini format)
         history.append({"role": "user", "content": user_input})
         history.append({"role": "assistant", "content": reply})
         if len(history) > MAX_HISTORY * 2:
             history = history[-(MAX_HISTORY * 2):]
         CHAT_HISTORY[user_id] = history
-        
+
         logger.info(f"🤖 Reply ke {user_id}: {len(reply)} chars (stock:{len(stock_data)}, cogs:{len(cogs_data)})")
         return reply
-    
+
     except Exception as e:
-        logger.error(f"❌ Claude error: {e}")
+        logger.error(f"❌ Gemini error: {e}")
         return f'⚠️ AI error: {str(e)[:150]}\n\nCoba ulangi pertanyaannya atau ketik /reload.'
 
 
@@ -445,11 +438,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(user_id):
         await update.message.reply_text(f'❌ Akses ditolak.\nUser ID: `{user_id}`', parse_mode='Markdown')
         return
-    ai_status = '🤖 Full AI Mode' if claude_client else '⚠️ AI off'
+    ai_status = '🤖 Full AI Mode' if gemini_model else '⚠️ AI off'
     msg = (
-        '👋 *Halo! StockBot v4.0 (Full AI)*\n\n'
+        '👋 *Halo! StockBot v4.1 (Full AI)*\n\n'
         f'{ai_status}\n\n'
-        'Saya dijalankan oleh Claude Sonnet 4.6.\n'
+        'Saya dijalankan oleh Gemini Flash.\n'
         'Tanya saya apa aja — natural language, casual, complex — semua OK!\n\n'
         '*Contoh:*\n'
         '• Cek stok ceplattyn\n'
@@ -469,8 +462,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     msg = (
-        '📖 *StockBot v4.0 — Bantuan*\n\n'
-        '🤖 Bot ini powered by Claude AI. Tanya apa aja!\n\n'
+        '📖 *StockBot v4.1 — Bantuan*\n\n'
+        '🤖 Bot ini powered by Gemini AI. Tanya apa aja!\n\n'
         '*Yang bisa ditanya:*\n'
         '• Cek stok produk\n'
         '• Cek COGS (semua source)\n'
@@ -522,8 +515,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f'   • Total entries: {len(df):,}')
         lines.append(f'   • Jumlah source: {sources}')
     lines.append('')
-    if claude_client:
-        lines.append('🤖 *AI:* Claude Sonnet 4.6 (FULL MODE)')
+    if gemini_model:
+        lines.append('🤖 *AI:* Gemini Flash (FULL MODE)')
     else:
         lines.append('⚠️ *AI:* off')
     user_id = update.effective_user.id
@@ -547,19 +540,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_text = update.message.text
     logger.info(f"Query from {user_id}: {user_text}")
-    
-    # Typing indicator
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-    
-    # Quick reset commands (non-slash)
+
     if user_text.upper().strip() in ['STOP', 'CLEAR', 'RESET']:
         reply = clear_history(user_id)
         await update.message.reply_text(reply)
         return
-    
-    # ALL queries → Claude AI
-    reply = ask_claude(user_text, user_id)
-    
+
+    reply = ask_gemini(user_text, user_id)
+
     if len(reply) > 4000:
         chunks = [reply[i:i+4000] for i in range(0, len(reply), 4000)]
         for chunk in chunks:
@@ -586,14 +576,14 @@ def main():
         return
     if not GDRIVE_COGS_FILE_ID:
         logger.warning("⚠️ GDRIVE_COGS_FILE_ID belum di-set.")
-    if not ANTHROPIC_API_KEY:
-        logger.error("❌ ANTHROPIC_API_KEY tidak di-set! Bot v4.0 butuh AI.")
+    if not GEMINI_API_KEY:
+        logger.error("❌ GEMINI_API_KEY tidak di-set! Bot v4.1 butuh AI.")
         return
-    
-    logger.info("🚀 Starting StockBot v4.0 (Full AI Mode)...")
+
+    logger.info("🚀 Starting StockBot v4.1 (Gemini Flash AI Mode)...")
     success, msg = load_all_data()
     logger.info(f"Initial load:\n{msg}")
-    
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -601,8 +591,8 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    logger.info("✅ Bot running with FULL AI...")
+
+    logger.info("✅ Bot running with Gemini Flash AI...")
     app.run_polling(drop_pending_updates=True)
 
 
