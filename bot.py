@@ -1,11 +1,10 @@
 """
-StockBot Telegram v4.1 — Full AI Assistant
-Powered by Gemini Flash. All queries handled by AI.
+StockBot Telegram v5.0 — Full AI Agent with Tool Calling
+Powered by Gemini. AI decides when & how to search the data.
 """
 import os
 import re
 import io
-import json
 import logging
 import pandas as pd
 import requests
@@ -23,23 +22,14 @@ ALLOWED_USER_IDS = os.environ.get('ALLOWED_USER_IDS', '')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 
 WAREHOUSE_COLS = ['ID30', 'ID40']
-GEMINI_MODEL = 'gemini-2.5-flash-lite'
-MAX_TOKENS = 1500
-MAX_CONTEXT_ROWS = 50  # Max data rows kasih ke AI
+GEMINI_MODEL = 'gemini-2.5-flash'  # Optimal untuk reasoning & tool calling
+MAX_TOOL_TURNS = 6  # Max berapa kali AI bisa panggil tool dalam 1 query
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-gemini_model = None
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel(GEMINI_MODEL)
-    logger.info("✅ Gemini AI client initialized")
-else:
-    logger.warning("⚠️ GEMINI_API_KEY belum di-set!")
 
 DATA = {
     'stock': None,
@@ -48,10 +38,8 @@ DATA = {
     'cogs_sheet': None,
 }
 
-# Chat history per user (max 6 turns)
 CHAT_HISTORY = {}
-MAX_HISTORY = 6
-
+MAX_HISTORY = 10
 
 # ─────────────────────────────────────────────
 # GOOGLE DRIVE LOADER
@@ -98,7 +86,6 @@ def load_stock_data():
         for col in WAREHOUSE_COLS:
             if col not in df.columns:
                 df[col] = 0
-        for col in WAREHOUSE_COLS:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         df['Total'] = df[WAREHOUSE_COLS].sum(axis=1)
         df['desc_clean'] = df['Material Description'].astype(str).str.strip().str.upper()
@@ -138,6 +125,7 @@ def load_cogs_data():
         missing = [c for c in required if c not in df.columns]
         if missing:
             return False, f"Kolom COGS missing: {missing}"
+        
         df['COGS'] = pd.to_numeric(df['COGS'], errors='coerce').fillna(0)
         df['Material Code'] = df['Material Code'].astype(str).str.strip()
         df['desc_clean'] = df['Material Description'].astype(str).str.strip().str.upper()
@@ -145,6 +133,7 @@ def load_cogs_data():
         df['source_clean'] = df['Source'].astype(str).str.strip().str.upper()
         df['Rata2 NC Sebelumnya'] = df['Rata2 NC Sebelumnya'].astype(str).str.strip()
         df = df[df['Material Code'].notna() & (df['Material Code'] != '') & (df['Material Code'] != 'nan')].reset_index(drop=True)
+        
         DATA['cogs'] = df
         DATA['cogs_sheet'] = latest_sheet
         logger.info(f"✅ COGS: {len(df)} entries from '{latest_sheet}'")
@@ -163,338 +152,421 @@ def load_all_data():
 
 
 # ─────────────────────────────────────────────
-# SMART DATA FETCHER (untuk AI context)
+# TOOLS — Fungsi yang bisa dipanggil AI
 # ─────────────────────────────────────────────
-COMMON_STOP_WORDS = {
-    'STOK', 'STOCK', 'COGS', 'COST', 'HARGA', 'BERAPA', 'YA', 'DONG',
-    'PRODUK', 'BARANG', 'UNTUK', 'DARI', 'KEMASAN', 'YANG', 'DI',
-    'DAN', 'SEMUA', 'ADA', 'CEK', 'CARI', 'LIHAT', 'TUNJUKKAN',
-    'MODAL', 'HPP', 'JUAL', 'NC', 'BAGAIMANA', 'GIMANA', 'APA',
-    'SAJA', 'MANA', 'LU', 'GW', 'GUE', 'KAMU', 'SAYA', 'AKU',
-    'KAYANYA', 'SALAH', 'DEH', 'COBA', 'TOLONG', 'BISA', 'MAU',
-    'TIDAK', 'GAK', 'NGGAK', 'KOK', 'KAN', 'AJA', 'SIH',
-    'INI', 'ITU', 'KE', 'PADA', 'OLEH', 'JUGA', 'TAPI',
-    'NAMUN', 'JADI', 'ATAU', 'KALAU', 'KALO', 'MISAL', 'CONTOH',
-    'BANYAK', 'SEDIKIT', 'BAGUS', 'JELEK', 'BAIK', 'BURUK',
-    'JIKA', 'BILA', 'AGAR', 'SUPAYA', 'KARENA', 'SEBAB',
-    'BIAR', 'SAMA', 'TERIMA', 'KASIH', 'HALO', 'HAI', 'OK', 'OKE',
-}
+def _stock_row_to_dict(row):
+    return {
+        'code': str(row.get('code_clean', '')),
+        'description': str(row['Material Description']).strip(),
+        'ID30': int(row['ID30']) if pd.notna(row['ID30']) else 0,
+        'ID40': int(row['ID40']) if pd.notna(row['ID40']) else 0,
+        'total': int(row['Total']) if pd.notna(row['Total']) else 0
+    }
 
+def _cogs_row_to_dict(row):
+    nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
+    return {
+        'code': str(row['Material Code']),
+        'description': str(row['Material Description']).strip(),
+        'source': str(row['Source']).strip(),
+        'cogs_rupiah': int(row['COGS']) if pd.notna(row['COGS']) else 0,
+        'update_label': str(row['Update']).strip(),
+        'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
+    }
 
-def extract_keywords(user_input):
-    """Extract keyword penting dari user input."""
-    text = user_input.upper()
-    codes = re.findall(r'\b\d{6,}\b', text)
-    words = []
-    seen = set()
-    for w in text.split():
-        if w in COMMON_STOP_WORDS:
-            continue
-        if w in seen:
-            continue
-        seen.add(w)
-        words.append(w)
-    return codes, words
-
-
-# Token kemasan: angka+satuan (205L, 1000L, 20KG) atau angka besar >= 100
-# "68" tidak dianggap kemasan karena bisa bagian nama produk (VG 68, B 68)
-PACKAGING_TOKEN = re.compile(
-    r'^\d+(L|LT|LITER|KG|G|ML|IBC|PLA|MET|AU|LG|DRUM)$'  # angka+satuan jelas
-    r'|^\d{4,}$',  # angka panjang >= 4 digit (1000, 2000, dll)
-    re.IGNORECASE
-)
-
-
-def split_product_and_packaging(words):
-    """Pisahkan kata nama produk vs ukuran kemasan.
-    Hanya token di akhir yang berupa angka+satuan atau angka >= 4 digit.
-    """
-    product_words = []
-    packaging_words = []
-    trailing = True
-    for w in reversed(words):
-        if trailing and PACKAGING_TOKEN.match(w):
-            packaging_words.insert(0, w)
-        else:
-            trailing = False
-            product_words.insert(0, w)
-    return product_words, packaging_words
-
-
-def build_phrase_variants(words):
-    """Bangun kandidat frasa dari kata-kata user, dari yang paling spesifik."""
-    product_words, packaging_words = split_product_and_packaging(words)
-    phrases = []
-
-    # Tier A: nama produk + kemasan (paling spesifik)
-    if packaging_words and product_words:
-        combined = product_words + packaging_words
-        if len(combined) >= 2:
-            phrases.append(' '.join(combined))
-
-    # Tier B: nama produk saja (sliding window)
-    all_words = product_words if product_words else words
-    if len(all_words) >= 2:
-        full = ' '.join(all_words)
-        if full not in phrases:
-            phrases.append(full)
-    for window in range(min(4, len(all_words)), 1, -1):
-        for i in range(len(all_words) - window + 1):
-            phrase = ' '.join(all_words[i:i+window])
-            if phrase not in phrases:
-                phrases.append(phrase)
-
-    # Tier C: kemasan saja
-    if packaging_words:
-        for w in packaging_words:
-            if w not in phrases:
-                phrases.append(w)
-
-    return phrases
-
-
-
-def fetch_relevant_data(user_input):
-    """Smart fetch data relevan dengan query user."""
-    codes, words = extract_keywords(user_input)
-
-    stock_data = []
-    cogs_data = []
-    stock_found_idx = set()
-    cogs_found_codes = set()
-
-    phrase_variants = build_phrase_variants(words)
-
-    def append_stock_row(idx, row):
-        if idx in stock_found_idx:
-            return
-        stock_found_idx.add(idx)
-        stock_data.append({
-            'desc': str(row['Material Description']).strip(),
-            'code': str(row.get('code_clean', '')),
-            'ID30': int(row['ID30']),
-            'ID40': int(row['ID40']),
-            'Total': int(row['Total'])
-        })
-
-    def append_cogs_row(row):
-        if row['Material Code'] in cogs_found_codes:
-            return
-        cogs_found_codes.add(row['Material Code'])
-        nc_prev = str(row.get('Rata2 NC Sebelumnya', '')).strip()
-        cogs_data.append({
-            'code': row['Material Code'],
-            'desc': str(row['Material Description']).strip(),
-            'source': str(row['Source']).strip(),
-            'cogs': int(row['COGS']),
-            'update': str(row['Update']).strip(),
-            'rata2_nc_sebelumnya': nc_prev if nc_prev != 'nan' else ''
-        })
-
-    # ─── STOCK ───
-    if DATA['stock'] is not None:
-        df = DATA['stock']
-
-        # Tier 0: Exact material code
-        if codes and 'code_clean' in df.columns:
-            for code in codes:
-                for idx, row in df[df['code_clean'] == code.upper()].iterrows():
-                    append_stock_row(idx, row)
-
-        # Tier 1: Phrase match (paling spesifik dulu, e.g. "RENOLIN B 68 PLUS")
-        for phrase in phrase_variants:
-            if len(stock_data) >= MAX_CONTEXT_ROWS:
-                break
-            phrase_mask = df['desc_clean'].str.contains(phrase, na=False, regex=False)
-            for idx, row in df[phrase_mask].head(30).iterrows():
-                append_stock_row(idx, row)
-                if len(stock_data) >= MAX_CONTEXT_ROWS:
-                    break
-
-        # Tier 2: Per kata (fallback jika phrase tidak cukup hasil)
-        for kw in words[:5]:
-            if len(stock_data) >= MAX_CONTEXT_ROWS:
-                break
-            kw_mask = df['desc_clean'].str.contains(kw, na=False, regex=False)
-            for idx, row in df[kw_mask].head(10).iterrows():
-                append_stock_row(idx, row)
-                if len(stock_data) >= MAX_CONTEXT_ROWS:
-                    break
-
-    # ─── COGS ───
-    if DATA['cogs'] is not None:
-        df = DATA['cogs']
-
-        # Tier 0: Exact material code
-        if codes:
-            for code in codes:
-                for _, row in df[df['code_clean'] == code.upper()].iterrows():
-                    append_cogs_row(row)
-
-        # Tier 1: Phrase match
-        for phrase in phrase_variants:
-            if len(cogs_data) >= MAX_CONTEXT_ROWS:
-                break
-            phrase_mask = df['desc_clean'].str.contains(phrase, na=False, regex=False)
-            for _, row in df[phrase_mask].head(30).iterrows():
-                append_cogs_row(row)
-                if len(cogs_data) >= MAX_CONTEXT_ROWS:
-                    break
-
-        # Tier 2: Per kata (fallback)
-        for kw in words[:5]:
-            if len(cogs_data) >= MAX_CONTEXT_ROWS:
-                break
-            kw_mask = df['desc_clean'].str.contains(kw, na=False, regex=False)
-            for _, row in df[kw_mask].head(10).iterrows():
-                append_cogs_row(row)
-                if len(cogs_data) >= MAX_CONTEXT_ROWS:
-                    break
-
-    return stock_data, cogs_data
-
-
-# ─────────────────────────────────────────────
-# GEMINI AI HANDLER
-# ─────────────────────────────────────────────
-def get_data_summary():
-    """Summary singkat tentang data yang ada."""
-    parts = []
-    if DATA['stock'] is not None:
-        df = DATA['stock']
-        parts.append(f"STOK: {len(df):,} produk (sheet: {DATA['stock_sheet']}). Warehouse: ID30, ID40.")
-    if DATA['cogs'] is not None:
-        df = DATA['cogs']
-        sources = df['Source'].unique().tolist()
-        parts.append(f"COGS: {len(df):,} entries (sheet: {DATA['cogs_sheet']}). Sources: {', '.join(sources)}.")
-    return ' | '.join(parts)
-
-
-def get_analytics_data():
-    """Pre-compute analytics untuk question analytics."""
+def tool_search_stock(keywords: str, limit: int = 30) -> dict:
     if DATA['stock'] is None:
-        return {}
+        return {'error': 'Data stok belum ter-load', 'results': []}
+
+    df = DATA['stock']
+    if not keywords or not keywords.strip():
+        return {'error': 'Keywords kosong', 'results': []}
+
+    kw_list = [k.strip().upper() for k in keywords.split() if k.strip()]
+    mask = pd.Series([True] * len(df), index=df.index)
+    for kw in kw_list:
+        mask &= df['desc_clean'].str.contains(re.escape(kw), na=False, regex=True)
+
+    matched = df[mask]
+    total = len(matched)
+    results = [_stock_row_to_dict(row) for _, row in matched.head(limit).iterrows()]
+
+    return {
+        'total_matches': total,
+        'returned': len(results),
+        'truncated': total > limit,
+        'results': results
+    }
+
+def tool_search_cogs(keywords: str, limit: int = 30) -> dict:
+    if DATA['cogs'] is None:
+        return {'error': 'Data COGS belum ter-load', 'results': []}
+
+    df = DATA['cogs']
+    if not keywords or not keywords.strip():
+        return {'error': 'Keywords kosong', 'results': []}
+
+    kw_list = [k.strip().upper() for k in keywords.split() if k.strip()]
+    mask = pd.Series([True] * len(df), index=df.index)
+    for kw in kw_list:
+        mask &= df['desc_clean'].str.contains(re.escape(kw), na=False, regex=True)
+
+    matched = df[mask]
+    total = len(matched)
+    results = [_cogs_row_to_dict(row) for _, row in matched.head(limit).iterrows()]
+
+    return {
+        'total_matches': total,
+        'returned': len(results),
+        'truncated': total > limit,
+        'results': results
+    }
+
+def tool_get_by_code(code: str) -> dict:
+    if not code or not code.strip():
+        return {'error': 'Code kosong'}
+
+    code = code.strip().upper()
+    stock_results = []
+    cogs_results = []
+
+    if DATA['stock'] is not None:
+        df = DATA['stock']
+        matched = df[df['code_clean'] == code]
+        stock_results = [_stock_row_to_dict(row) for _, row in matched.iterrows()]
+
+    if DATA['cogs'] is not None:
+        df = DATA['cogs']
+        matched = df[df['code_clean'] == code]
+        cogs_results = [_cogs_row_to_dict(row) for _, row in matched.iterrows()]
+
+    return {
+        'code': code,
+        'stock': stock_results,
+        'cogs': cogs_results,
+        'stock_count': len(stock_results),
+        'cogs_count': len(cogs_results)
+    }
+
+def tool_get_analytics() -> dict:
+    if DATA['stock'] is None:
+        return {'error': 'Data stok belum ter-load'}
+
     df = DATA['stock']
     return {
         'total_produk': len(df),
         'stok_kosong': int(len(df[df['Total'] == 0])),
         'ada_stok': int(len(df[df['Total'] > 0])),
-        'total_id30': int(df['ID30'].sum()),
-        'total_id40': int(df['ID40'].sum()),
-        'grand_total': int(df['Total'].sum()),
+        'total_id30': int(df['ID30'].sum() if pd.notna(df['ID30'].sum()) else 0),
+        'total_id40': int(df['ID40'].sum() if pd.notna(df['ID40'].sum()) else 0),
+        'grand_total': int(df['Total'].sum() if pd.notna(df['Total'].sum()) else 0),
         'top_10_terbanyak': [
-            {'desc': str(row['Material Description']).strip(), 'total': int(row['Total']),
-             'id30': int(row['ID30']), 'id40': int(row['ID40'])}
+            _stock_row_to_dict(row)
             for _, row in df[df['Total'] > 0].nlargest(10, 'Total').iterrows()
         ],
         'top_10_tersedikit': [
-            {'desc': str(row['Material Description']).strip(), 'total': int(row['Total']),
-             'id30': int(row['ID30']), 'id40': int(row['ID40'])}
+            _stock_row_to_dict(row)
             for _, row in df[df['Total'] > 0].nsmallest(10, 'Total').iterrows()
         ],
     }
 
+def tool_list_empty_stock(keywords: str = '', limit: int = 50) -> dict:
+    if DATA['stock'] is None:
+        return {'error': 'Data stok belum ter-load', 'results': []}
 
-def build_system_prompt(data_context):
-    return f"""Kamu adalah StockBot, asisten AI untuk perusahaan pelumas. Bantu user dengan inventory, COGS, harga jual, margin (NC), dan analisa bisnis.
+    df = DATA['stock']
+    empty = df[df['Total'] == 0]
 
-ATURAN:
-1. Jawab pakai Bahasa Indonesia kasual tapi profesional.
-2. JANGAN mengarang data — hanya berdasarkan data yang dikasih.
-3. Kalau data tidak match query user, bilang apa adanya & kasih saran cek ejaan/code.
-4. Format angka: pakai pemisah ribuan, contoh Rp 50.000.
-5. Output ringkas (max 250 kata). Pakai bullet point + emoji secukupnya.
-6. Pakai Markdown Telegram: *bold*, `code`.
+    if keywords and keywords.strip():
+        kw_list = [k.strip().upper() for k in keywords.split() if k.strip()]
+        mask = pd.Series([True] * len(empty), index=empty.index)
+        for kw in kw_list:
+            mask &= empty['desc_clean'].str.contains(re.escape(kw), na=False, regex=True)
+        empty = empty[mask]
+
+    total = len(empty)
+    results = [_stock_row_to_dict(row) for _, row in empty.head(limit).iterrows()]
+    return {
+        'total_matches': total,
+        'returned': len(results),
+        'truncated': total > limit,
+        'results': results
+    }
+
+def tool_list_cogs_sources() -> dict:
+    if DATA['cogs'] is None:
+        return {'error': 'Data COGS belum ter-load'}
+    df = DATA['cogs']
+    sources = df['Source'].value_counts().to_dict()
+    return {'sources': {str(k): int(v) for k, v in sources.items()}}
+
+TOOL_FUNCTIONS = {
+    'search_stock': tool_search_stock,
+    'search_cogs': tool_search_cogs,
+    'get_by_code': tool_get_by_code,
+    'get_analytics': tool_get_analytics,
+    'list_empty_stock': tool_list_empty_stock,
+    'list_cogs_sources': tool_list_cogs_sources,
+}
+
+
+# ─────────────────────────────────────────────
+# GEMINI TOOL DECLARATIONS
+# ─────────────────────────────────────────────
+TOOL_DECLARATIONS = [
+    {
+        'name': 'search_stock',
+        'description': (
+            'Cari produk di tabel STOK berdasarkan keyword di Material Description. '
+            'Semua kata di parameter keywords harus muncul (AND search). '
+            'Untuk produk pelumas, gunakan nama produk + spec/kemasan, contoh: '
+            '"RENOLIN B 68 PLUS 1000L" atau "TITAN GT1 5W30". '
+            'Return: kode material, description, ID30 (stok gudang 30), ID40 (stok gudang 40), total.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'keywords': {
+                    'type': 'string',
+                    'description': 'Keyword pencarian, dipisah spasi. Contoh: "RENOLIN B 68 PLUS"'
+                },
+                'limit': {
+                    'type': 'integer',
+                    'description': 'Max hasil, default 30'
+                }
+            },
+            'required': ['keywords']
+        }
+    },
+    {
+        'name': 'search_cogs',
+        'description': (
+            'Cari di tabel COGS berdasarkan keyword nama produk (AND search). '
+            'Return: COGS dalam Rupiah, Source (LOKAL/IMPORT), label update terakhir, '
+            'dan rata-rata NC sebelumnya. '
+            'PENTING: 1 produk fisik bisa punya MULTI-SOURCE dengan code berbeda. '
+            'Selalu cek SEMUA hasil yang return, jangan ambil yang pertama saja.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'keywords': {
+                    'type': 'string',
+                    'description': 'Keyword pencarian. Contoh: "RENOLIN B 68 PLUS 1000L"'
+                },
+                'limit': {
+                    'type': 'integer',
+                    'description': 'Max hasil, default 30'
+                }
+            },
+            'required': ['keywords']
+        }
+    },
+    {
+        'name': 'get_by_code',
+        'description': (
+            'Cari produk berdasarkan Material Code EXACT (kode 6+ digit angka). '
+            'Cek di tabel STOK dan COGS sekaligus. '
+            'PENTING: code di stok dan COGS bisa beda untuk produk yang sama — '
+            'kalau salah satu tabel tidak match, lanjutkan dengan search_stock/search_cogs by description.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'code': {
+                    'type': 'string',
+                    'description': 'Material code, contoh: "602723550"'
+                }
+            },
+            'required': ['code']
+        }
+    },
+    {
+        'name': 'get_analytics',
+        'description': (
+            'Ringkasan analytics inventory: total produk, stok kosong vs ada, '
+            'total per warehouse, top 10 terbanyak & tersedikit. '
+            'Pakai untuk pertanyaan umum seperti "rekap stok", "produk paling banyak", dll.'
+        ),
+        'parameters': {'type': 'object', 'properties': {}}
+    },
+    {
+        'name': 'list_empty_stock',
+        'description': (
+            'List produk yang stoknya kosong (total = 0), optional filter dengan keyword. '
+            'Pakai untuk pertanyaan "produk apa yang kosong" atau "stok kosong renolin".'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'keywords': {
+                    'type': 'string',
+                    'description': 'Optional filter by keyword di description.'
+                },
+                'limit': {
+                    'type': 'integer',
+                    'description': 'Max hasil, default 50'
+                }
+            }
+        }
+    },
+    {
+        'name': 'list_cogs_sources',
+        'description': 'List semua unique Source (LOKAL, IMPORT, dll) di tabel COGS.',
+        'parameters': {'type': 'object', 'properties': {}}
+    },
+]
+
+
+# ─────────────────────────────────────────────
+# GEMINI CLIENT (UPDATED)
+# ─────────────────────────────────────────────
+gemini_initialized = False
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_initialized = True
+    logger.info(f"✅ Gemini configured ({GEMINI_MODEL}) with {len(TOOL_DECLARATIONS)} tools")
+else:
+    logger.warning("⚠️ GEMINI_API_KEY belum di-set!")
+
+def get_system_prompt():
+    stock_info = "belum ter-load"
+    cogs_info = "belum ter-load"
+    if DATA['stock'] is not None:
+        stock_info = f"{len(DATA['stock']):,} produk dari sheet '{DATA['stock_sheet']}'"
+    if DATA['cogs'] is not None:
+        cogs_info = f"{len(DATA['cogs']):,} entries dari sheet '{DATA['cogs_sheet']}'"
+
+    return f"""Kamu adalah StockBot, asisten AI cerdas untuk perusahaan pelumas. Kamu chat dengan user di Telegram seperti ngobrol biasa — santai, ramah, profesional, pakai Bahasa Indonesia natural.
+
+DATA YANG TERSEDIA:
+- Tabel STOK: {stock_info}. Kolom: Material Code, Material Description, ID30 (gudang 30), ID40 (gudang 40), Total.
+- Tabel COGS: {cogs_info}. Kolom: Material Code, Material Description, Source, COGS (Rupiah), Update label, Rata2 NC Sebelumnya.
+
+KAMU PUNYA TOOLS untuk akses data — JANGAN PERNAH ngarang data! Selalu pakai tools.
+
+STRATEGI PENCARIAN (PENTING!):
+1. Untuk produk spesifik, panggil search_stock DAN search_cogs.
+2. Kalau hasil pertama tidak match yang user maksud, COBA LAGI dengan keyword berbeda:
+   - Hilangkan kata yang tidak spesifik
+   - Coba variasi penulisan ("1000L" vs "1000 L" vs "1000")
+   - Coba dengan/tanpa spec (AU, MET, IBC, PLA, LG)
+3. Kalau user kasih kode 6+ digit, pakai get_by_code dulu.
+4. Kalau hasil truncated (truncated=true), narrow query lebih spesifik.
+5. 1 produk fisik bisa punya MULTI VARIAN kemasan (20L, 205L, 1000L) DAN multi-source di COGS.
+6. Material code di STOK dan COGS BISA BEDA untuk produk yang sama.
+
+PENGETAHUAN PRODUK:
+- Format nama: BRAND + GRADE/SERI + SPEC + KEMASAN
+- Contoh: "RENOLIN B 68 PLUS 1000L IBC AU"
+  - RENOLIN = brand, B 68 PLUS = grade, 1000L IBC = kemasan, AU = spec
+- "renolin b 68 plus" tanpa kemasan = ada beberapa varian (20L, 205L, 1000L)
 
 FORMULA:
 - NC% = (Harga Jual - COGS) / Harga Jual × 100
 - Harga Jual = COGS / (1 - NC%/100)
 
-PENTING SOAL MATERIAL CODE:
-- Material code di STOK dan COGS BISA BEDA untuk produk yang sama (karena beda source/supplier).
-- Kalau user kasih kode stok tapi data COGS pakai kode lain, cari COGS by deskripsi produk.
-- 1 produk fisik bisa punya multi-source dengan beda kode (Local, Jerman, China, dll).
+ATURAN OUTPUT:
+- Jawab natural seperti ngobrol — JANGAN kaku/formal/bertele-tele.
+- Format Rupiah pakai pemisah ribuan: Rp 36.934.577.
+- Pakai Markdown Telegram: *bold*, `code`.
+- Pakai emoji secukupnya (1-2), jangan berlebihan.
+- Kalau data ada multi varian/source, LIST SEMUA — biar user yang pilih.
+- Jangan tutup dengan basa-basi "Ada lagi yang bisa dibantu?".
+- Kalau bener-bener tidak ketemu setelah beberapa kali coba, jujur bilang."""
 
-CARA KERJA DATA:
-- Kolom STOK: Material Description, code, ID30, ID40, Total.
-- Kolom COGS: code, desc, source, cogs (Rupiah), update = label COGS update terakhir (bukan margin update), rata2_nc_sebelumnya.
-- Sheet COGS paling kanan = paling baru.
+def call_tool(tool_name: str, args: dict) -> dict:
+    func = TOOL_FUNCTIONS.get(tool_name)
+    if not func:
+        return {'error': f'Unknown tool: {tool_name}'}
+    try:
+        result = func(**args)
+        n = result.get('total_matches', result.get('stock_count', 'ok'))
+        logger.info(f"🔧 {tool_name}({args}) → {n}")
+        return result
+    except Exception as e:
+        logger.error(f"❌ Tool {tool_name} error: {e}")
+        return {'error': str(e)}
 
-DATA KONTEKS:
-{data_context}"""
-
-
-def ask_gemini(user_input, user_id):
-    """Send query to Gemini with smart context."""
-    if not gemini_model:
+def ask_gemini(user_input: str, user_id: int) -> str:
+    if not gemini_initialized:
         return '⚠️ Fitur AI belum aktif. Hubungi admin untuk set GEMINI_API_KEY.'
 
     try:
-        # Fetch relevant data
-        stock_data, cogs_data = fetch_relevant_data(user_input)
-
-        wants_analytics = any(kw in user_input.upper() for kw in [
-            'PALING', 'TOP', 'REKAP', 'RINGKASAN', 'TOTAL SEMUA',
-            'KOSONG', 'HABIS', 'TERBANYAK', 'TERSEDIKIT'
-        ])
-
-        analytics = get_analytics_data() if wants_analytics else None
-        data_summary = get_data_summary()
-
-        # Build context
-        context_parts = [f"DATA SUMMARY: {data_summary}"]
-        if analytics:
-            context_parts.append(f"\nANALYTICS:\n{json.dumps(analytics, indent=2, ensure_ascii=False)}")
-        if stock_data:
-            context_parts.append(f"\nSTOK RELEVAN ({len(stock_data)} hasil):\n{json.dumps(stock_data, indent=2, ensure_ascii=False)}")
-        if cogs_data:
-            context_parts.append(f"\nCOGS RELEVAN ({len(cogs_data)} hasil):\n{json.dumps(cogs_data, indent=2, ensure_ascii=False)}")
-        if not stock_data and not cogs_data and not analytics:
-            context_parts.append("\n(Tidak ada data spesifik yang match. User mungkin tanya hal umum.)")
-
-        data_context = '\n'.join(context_parts)
-        system_prompt = build_system_prompt(data_context)
-
-        # Build chat history untuk Gemini format
-        # Gemini pakai format: [{"role": "user"/"model", "parts": [{"text": "..."}]}]
+        # Build history dengan format terstandarisasi untuk Gemini
         history = CHAT_HISTORY.get(user_id, [])
         gemini_history = []
         for msg in history:
             role = "model" if msg["role"] == "assistant" else "user"
-            gemini_history.append({"role": role, "parts": [{"text": msg["content"]}]})
+            gemini_history.append({"role": role, "parts": [msg["content"]]})
 
-        # Start chat session dengan history
-        chat = gemini_model.start_chat(history=gemini_history)
-
-        # Gabungkan system prompt + user input (Gemini Flash tidak punya system role terpisah)
-        full_prompt = f"{system_prompt}\n\n---\nPertanyaan user: {user_input}"
-
-        response = chat.send_message(
-            full_prompt,
-            generation_config=genai.GenerationConfig(max_output_tokens=MAX_TOKENS)
+        system_prompt = get_system_prompt()
+        
+        # Konfigurasi model: Masukkan tools langsung sebagai list dari deklarasi fungsi
+        chat_model = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            tools=TOOL_DECLARATIONS,
+            system_instruction=system_prompt
         )
-        reply = response.text
+        
+        chat = chat_model.start_chat(history=gemini_history)
+        response = chat.send_message(user_input)
 
-        # Save history (simpan format asli, bukan Gemini format)
+        # Agent loop untuk menangani multi-turn tool calling
+        for turn in range(MAX_TOOL_TURNS):
+            function_calls = response.function_calls
+            if not function_calls:
+                break  # Berhenti jika tidak ada panggilan fungsi lagi
+
+            tool_parts = []
+            for fc in function_calls:
+                tool_name = fc.name
+                args = dict(fc.args) if fc.args else {}
+                
+                result = call_tool(tool_name, args)
+                
+                # Bungkus sesuai spesifikasi SDK untuk FunctionResponse
+                tool_parts.append(
+                    genai.types.Part(
+                        function_response=genai.types.FunctionResponse(
+                            name=tool_name,
+                            response={'result': result}
+                        )
+                    )
+                )
+
+            # Kirim hasil eksekusi kembali ke model
+            response = chat.send_message(tool_parts)
+
+        # Ambil text respons akhir
+        reply = response.text if response.text else ''
+        
+        if not reply:
+            reply_parts = [part.text for part in response.candidates[0].content.parts if hasattr(part, 'text') and part.text]
+            reply = '\n'.join(reply_parts).strip()
+
+        if not reply:
+            reply = '⚠️ AI tidak menghasilkan jawaban. Coba perkecil keyword pencarian Anda.'
+
+        # Simpan pesan sukses ke history lokal
         history.append({"role": "user", "content": user_input})
         history.append({"role": "assistant", "content": reply})
+        
         if len(history) > MAX_HISTORY * 2:
             history = history[-(MAX_HISTORY * 2):]
         CHAT_HISTORY[user_id] = history
 
-        logger.info(f"🤖 Reply ke {user_id}: {len(reply)} chars (stock:{len(stock_data)}, cogs:{len(cogs_data)})")
+        logger.info(f"🤖 Reply ke {user_id}: {len(reply)} chars")
         return reply
 
     except Exception as e:
-        logger.error(f"❌ Gemini error: {e}")
-        return f'⚠️ AI error: {str(e)[:150]}\n\nCoba ulangi pertanyaannya atau ketik /reload.'
-
+        logger.error(f"❌ Gemini error: {e}", exc_info=True)
+        return f'⚠️ AI error: {str(e)[:200]}\n\nCoba ulangi atau bersihkan sesi dengan /clear.'
 
 def clear_history(user_id):
     if user_id in CHAT_HISTORY:
         del CHAT_HISTORY[user_id]
-        return '🔄 Chat history di-reset. Mulai dari awal lagi!'
+        return '🔄 Chat history di-reset.'
     return '✅ Tidak ada history aktif.'
 
 
@@ -507,48 +579,37 @@ def is_allowed(user_id):
     allowed = [int(x.strip()) for x in ALLOWED_USER_IDS.split(',') if x.strip()]
     return user_id in allowed
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_allowed(user_id):
         await update.message.reply_text(f'❌ Akses ditolak.\nUser ID: `{user_id}`', parse_mode='Markdown')
         return
-    ai_status = '🤖 Full AI Mode' if gemini_model else '⚠️ AI off'
+    ai_status = '🤖 Agent Mode (Tool Calling)' if gemini_initialized else '⚠️ AI off'
     msg = (
-        '👋 *Halo! StockBot v4.1 (Full AI)*\n\n'
+        '👋 *StockBot v5.0 — Full AI Agent*\n\n'
         f'{ai_status}\n\n'
-        'Saya dijalankan oleh Gemini Flash.\n'
-        'Tanya saya apa aja — natural language, casual, complex — semua OK!\n\n'
+        'Ngobrol aja sama saya kayak chat biasa.\n'
+        'Saya cari datanya sendiri & kasih jawaban akurat.\n\n'
         '*Contoh:*\n'
-        '• Cek stok ceplattyn\n'
-        '• Berapa cost titan plus 205L dari local?\n'
-        '• Hitung harga jual kalau NC 30%\n'
-        '• Bandingkan margin titan vs ceplattyn\n'
-        '• Saran restock produk apa minggu depan?\n\n'
+        '• cost renolin b 68 plus 1000\n'
+        '• stok titan plus 205l ada berapa?\n'
+        '• 602723550 ini barang apa?\n'
+        '• kalau jual NC 25%, harganya berapa?\n'
+        '• produk apa stoknya paling banyak?\n\n'
         '*Commands:*\n'
         '/reload — refresh data\n'
         '/status — info data\n'
-        '/clear — reset chat history'
+        '/clear — reset chat'
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
-
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     msg = (
-        '📖 *StockBot v4.1 — Bantuan*\n\n'
-        '🤖 Bot ini powered by Gemini AI. Tanya apa aja!\n\n'
-        '*Yang bisa ditanya:*\n'
-        '• Cek stok produk\n'
-        '• Cek COGS (semua source)\n'
-        '• Hitung NC / harga jual\n'
-        '• Analisa & rekomendasi\n'
-        '• Bandingkan produk\n\n'
-        '*Tips:*\n'
-        '• Bot ingat percakapan sebelumnya\n'
-        '• Ketik `/clear` untuk reset history\n'
-        '• Material code di STOK & COGS bisa beda, bot otomatis match by nama\n\n'
+        '📖 *StockBot v5.0 — Help*\n\n'
+        'Bot ini full AI agent. Tanya apa aja pakai bahasa natural — '
+        'AI bakal mikir & cari datanya sendiri.\n\n'
         '*Commands:*\n'
         '/reload — refresh data dari Google Drive\n'
         '/status — info data ter-load\n'
@@ -556,15 +617,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
-
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
-    await update.message.reply_text('🔄 Memuat ulang data dari Google Drive...')
+    await update.message.reply_text('🔄 Loading data dari Google Drive...')
     success, message = load_all_data()
     icon = '✅' if success else '❌'
-    await update.message.reply_text(f'{icon} Hasil reload:\n\n{message}')
-
+    await update.message.reply_text(f'{icon} Hasil:\n\n{message}')
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -576,7 +635,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df = DATA['stock']
         lines.append(f'✅ *STOK:*')
         lines.append(f'   • Sheet: `{DATA["stock_sheet"]}`')
-        lines.append(f'   • Total produk: {len(df):,}')
+        lines.append(f'   • Total: {len(df):,}')
         lines.append(f'   • Ada stok: {len(df[df["Total"] > 0]):,}')
         lines.append(f'   • Kosong: {len(df[df["Total"] == 0]):,}')
     lines.append('')
@@ -584,21 +643,19 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append('⚠️ *COGS:* belum ter-load')
     else:
         df = DATA['cogs']
-        sources = df['Source'].nunique()
         lines.append(f'✅ *COGS:*')
         lines.append(f'   • Sheet: `{DATA["cogs_sheet"]}`')
-        lines.append(f'   • Total entries: {len(df):,}')
-        lines.append(f'   • Jumlah source: {sources}')
+        lines.append(f'   • Entries: {len(df):,}')
+        lines.append(f'   • Sources: {df["Source"].nunique()}')
     lines.append('')
-    if gemini_model:
-        lines.append('🤖 *AI:* Gemini Flash (FULL MODE)')
+    if gemini_initialized:
+        lines.append(f'🤖 *AI:* {GEMINI_MODEL} (Agent Mode)')
     else:
         lines.append('⚠️ *AI:* off')
     user_id = update.effective_user.id
     if user_id in CHAT_HISTORY:
-        lines.append(f'\n💬 *Chat history:* {len(CHAT_HISTORY[user_id])//2} turn')
+        lines.append(f'\n💬 *History:* {len(CHAT_HISTORY[user_id])//2} turn')
     await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
-
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -606,7 +663,6 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     reply = clear_history(user_id)
     await update.message.reply_text(reply)
-
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -652,10 +708,10 @@ def main():
     if not GDRIVE_COGS_FILE_ID:
         logger.warning("⚠️ GDRIVE_COGS_FILE_ID belum di-set.")
     if not GEMINI_API_KEY:
-        logger.error("❌ GEMINI_API_KEY tidak di-set! Bot v4.1 butuh AI.")
+        logger.error("❌ GEMINI_API_KEY tidak di-set!")
         return
 
-    logger.info("🚀 Starting StockBot v4.1 (Gemini Flash AI Mode)...")
+    logger.info("🚀 Starting StockBot v5.0 (Agent Mode)...")
     success, msg = load_all_data()
     logger.info(f"Initial load:\n{msg}")
 
@@ -667,7 +723,7 @@ def main():
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("✅ Bot running with Gemini Flash AI...")
+    logger.info("✅ Bot running...")
     app.run_polling(drop_pending_updates=True)
 
 
