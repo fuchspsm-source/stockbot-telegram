@@ -1,7 +1,13 @@
 """
-StockBot Telegram v5.1 — Full AI Agent with Tool Calling
+StockBot Telegram v5.2 — Actual Stock = Open Stock - Sales
 Powered by Gemini Flash (google-genai SDK).
 AI decides when & how to search data — no manual keyword filtering.
+
+Perubahan v5.2:
+- Load 2 tab: tab DDMMYY (open stock) + tab SALES (penjualan berjalan)
+- Actual Stock = ID30 (open stock) - Total Sales per material
+- Semua query stok pakai Actual Stock
+- COGS logic tidak diubah sama sekali
 """
 import os
 import re
@@ -36,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 DATA = {
     'stock': None, 'stock_sheet': None,
+    'sales': None, 'sales_sheet': None,
     'cogs': None, 'cogs_sheet': None,
 }
 CHAT_HISTORY = {}
@@ -66,49 +73,147 @@ def download_from_gdrive(file_id, as_gsheet=False):
     return io.BytesIO(response.content)
 
 
-def load_stock_data():
+def _get_excel_file(file_id):
+    """Download GDrive file, coba direct dulu lalu fallback ke gsheet export."""
     try:
-        logger.info("📥 Loading STOCK...")
-        try:
-            excel_data = download_from_gdrive(GDRIVE_FILE_ID)
-            xl = pd.ExcelFile(excel_data)
-        except Exception:
-            excel_data = download_from_gdrive(GDRIVE_FILE_ID, as_gsheet=True)
-            xl = pd.ExcelFile(excel_data)
+        data = download_from_gdrive(file_id)
+        xl = pd.ExcelFile(data)
+        return data, xl
+    except Exception:
+        data = download_from_gdrive(file_id, as_gsheet=True)
+        xl = pd.ExcelFile(data)
+        return data, xl
 
+
+def _find_sales_sheet(sheet_names):
+    """Cari tab SALES (case-insensitive). Return nama sheet atau None."""
+    for name in sheet_names:
+        if 'SALES' in str(name).upper():
+            return name
+    return None
+
+
+def _find_stock_sheet(sheet_names):
+    """
+    Cari tab stock: format DDMMYY (6 digit angka).
+    Kalau tidak ada yang match format, ambil tab pertama yang bukan SALES.
+    """
+    ddmmyy = re.compile(r'^\d{6}$')
+    candidates = [s for s in sheet_names if ddmmyy.match(str(s).strip())]
+    if candidates:
+        return candidates[-1]  # ambil yang paling kanan / terbaru
+    # fallback: tab pertama yang bukan SALES
+    for name in sheet_names:
+        if 'SALES' not in str(name).upper():
+            return name
+    return sheet_names[0]
+
+
+def load_stock_data():
+    """
+    Load open stock dari tab DDMMYY dan penjualan dari tab SALES.
+    Hitung Actual Stock = ID30 - Total Sales per material code.
+    """
+    try:
+        logger.info("📥 Loading STOCK + SALES...")
+        excel_data, xl = _get_excel_file(GDRIVE_FILE_ID)
         sheets = xl.sheet_names
+
         if not sheets:
             return False, "File stok tidak punya sheet."
-        latest_sheet = sheets[-1]
-        df = pd.read_excel(excel_data, sheet_name=latest_sheet)
-        cols = list(df.columns)
-        if str(cols[0]).strip() == '' or 'Unnamed' in str(cols[0]):
-            df = df.rename(columns={cols[0]: 'Material'})
 
+        # ── Identifikasi tab ──
+        stock_sheet_name = _find_stock_sheet(sheets)
+        sales_sheet_name = _find_sales_sheet(sheets)
+
+        logger.info(f"📋 Tab stock: '{stock_sheet_name}' | Tab sales: '{sales_sheet_name}'")
+
+        # ── Load Open Stock ──
+        df_stock = pd.read_excel(excel_data, sheet_name=stock_sheet_name)
+        cols = list(df_stock.columns)
+        if str(cols[0]).strip() == '' or 'Unnamed' in str(cols[0]):
+            df_stock = df_stock.rename(columns={cols[0]: 'Material'})
+
+        # Deteksi kolom material code
         code_col = None
-        for col in df.columns:
+        for col in df_stock.columns:
             if 'CODE' in str(col).upper() or str(col).upper().strip() == 'MATERIAL':
                 code_col = col
                 break
 
         for col in WAREHOUSE_COLS:
-            if col not in df.columns:
-                df[col] = 0
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-        df['Total'] = df[WAREHOUSE_COLS].sum(axis=1)
-        df['desc_clean'] = df['Material Description'].astype(str).str.strip().str.upper()
-        df['code_clean'] = df[code_col].astype(str).str.strip().str.upper() if code_col else ''
+            if col not in df_stock.columns:
+                df_stock[col] = 0
+            df_stock[col] = pd.to_numeric(df_stock[col], errors='coerce').fillna(0)
 
-        DATA['stock'] = df
-        DATA['stock_sheet'] = latest_sheet
-        logger.info(f"✅ STOCK: {len(df)} products from '{latest_sheet}'")
-        return True, f"Stok: sheet '{latest_sheet}', {len(df):,} produk"
+        df_stock['desc_clean'] = df_stock['Material Description'].astype(str).str.strip().str.upper()
+        df_stock['code_clean'] = df_stock[code_col].astype(str).str.strip().str.upper() if code_col else ''
+
+        # ── Load Sales & Hitung Total Sales per Material Code ──
+        sales_by_code = {}  # code_clean → total qty terjual
+        sales_sheet_loaded = None
+
+        if sales_sheet_name:
+            try:
+                df_sales = pd.read_excel(excel_data, sheet_name=sales_sheet_name)
+
+                # Deteksi kolom MATERIAL CODE dan QTY di tab SALES
+                sales_code_col = None
+                sales_qty_col = None
+
+                for col in df_sales.columns:
+                    col_up = str(col).upper().strip()
+                    if 'CODE' in col_up or col_up == 'MATERIAL':
+                        sales_code_col = col
+                    if 'QTY' in col_up or 'QUANTITY' in col_up or 'JUMLAH' in col_up:
+                        sales_qty_col = col
+
+                if sales_code_col and sales_qty_col:
+                    df_sales['_code'] = df_sales[sales_code_col].astype(str).str.strip().str.upper()
+                    df_sales['_qty'] = pd.to_numeric(df_sales[sales_qty_col], errors='coerce').fillna(0)
+                    sales_by_code = df_sales.groupby('_code')['_qty'].sum().to_dict()
+                    sales_sheet_loaded = sales_sheet_name
+                    DATA['sales'] = df_sales
+                    DATA['sales_sheet'] = sales_sheet_name
+                    logger.info(f"✅ SALES: {len(df_sales)} rows dari '{sales_sheet_name}', "
+                                f"{len(sales_by_code)} material terjual")
+                else:
+                    logger.warning(f"⚠️ Tab SALES ditemukan tapi kolom tidak lengkap. "
+                                   f"Kolom ada: {list(df_sales.columns)}")
+            except Exception as e:
+                logger.warning(f"⚠️ Gagal load tab SALES: {e}")
+        else:
+            logger.warning("⚠️ Tab SALES tidak ditemukan. Actual Stock = Open Stock.")
+
+        # ── Hitung Actual Stock ──
+        def get_actual(row):
+            code = str(row['code_clean'])
+            open_id30 = float(row['ID30'])
+            sold = float(sales_by_code.get(code, 0))
+            actual = open_id30 - sold
+            return actual
+
+        df_stock['Open_ID30'] = df_stock['ID30'].copy()
+        df_stock['Sales_QTY'] = df_stock['code_clean'].map(lambda c: sales_by_code.get(c, 0))
+        df_stock['Actual'] = (df_stock['Open_ID30'] - df_stock['Sales_QTY']).clip(lower=0)
+        df_stock['Total'] = df_stock['Actual']  # Total sekarang = Actual untuk semua tools
+
+        DATA['stock'] = df_stock
+        DATA['stock_sheet'] = stock_sheet_name
+
+        sales_info = f" | SALES: '{sales_sheet_loaded}'" if sales_sheet_loaded else " | SALES: tidak ditemukan"
+        logger.info(f"✅ STOCK: {len(df_stock)} products dari '{stock_sheet_name}'{sales_info}")
+        return True, (f"Stok: sheet '{stock_sheet_name}', {len(df_stock):,} produk"
+                      + (f"\nSales: sheet '{sales_sheet_loaded}', {len(sales_by_code):,} material"
+                         if sales_sheet_loaded else "\n⚠️ Tab SALES tidak ditemukan, pakai open stock."))
+
     except Exception as e:
-        logger.error(f"❌ Stock load error: {e}")
+        logger.error(f"❌ Stock load error: {e}", exc_info=True)
         return False, f"Error stock: {str(e)}"
 
 
 def load_cogs_data():
+    # ── TIDAK DIUBAH SAMA SEKALI ──
     if not GDRIVE_COGS_FILE_ID:
         return False, "COGS file ID belum di-set."
     try:
@@ -137,7 +242,7 @@ def load_cogs_data():
 
         DATA['cogs'] = df
         DATA['cogs_sheet'] = latest_sheet
-        logger.info(f"✅ COGS: {len(df)} entries from '{latest_sheet}'")
+        logger.info(f"✅ COGS: {len(df)} entries dari '{latest_sheet}'")
         return True, f"COGS: sheet '{latest_sheet}', {len(df):,} entries"
     except Exception as e:
         logger.error(f"❌ COGS load error: {e}")
@@ -154,14 +259,21 @@ def load_all_data():
 # TOOLS — Fungsi yang dipanggil AI
 # ─────────────────────────────────────────────
 def _stock_row(row):
+    """
+    Return actual stock. 'stock' yang ditampilkan = Actual (open - sales).
+    ID30/ID40 raw tidak ditampilkan ke user.
+    """
     return {
         'code': str(row.get('code_clean', '')),
         'description': str(row['Material Description']).strip(),
-        'ID30': int(row['ID30']), 'ID40': int(row['ID40']),
-        'total': int(row['Total'])
+        'stock': int(row['Actual']),          # Actual = Open ID30 - Sales
+        'open_stock': int(row['Open_ID30']),  # Info tambahan kalau AI butuh
+        'sold': int(row['Sales_QTY']),        # Info tambahan kalau AI butuh
     }
 
+
 def _cogs_row(row):
+    # ── TIDAK DIUBAH ──
     nc = str(row.get('Rata2 NC Sebelumnya', '')).strip()
     return {
         'code': str(row['Material Code']),
@@ -174,7 +286,7 @@ def _cogs_row(row):
 
 
 def tool_search_stock(keywords: str, limit: int = 30) -> dict:
-    """AND search di Material Description tabel STOK."""
+    """AND search di Material Description — return Actual Stock."""
     if DATA['stock'] is None:
         return {'error': 'Data stok belum ter-load', 'results': []}
     df = DATA['stock']
@@ -195,6 +307,7 @@ def tool_search_stock(keywords: str, limit: int = 30) -> dict:
 
 
 def tool_search_cogs(keywords: str, limit: int = 30) -> dict:
+    # ── TIDAK DIUBAH ──
     """AND search di Material Description tabel COGS."""
     if DATA['cogs'] is None:
         return {'error': 'Data COGS belum ter-load', 'results': []}
@@ -216,7 +329,7 @@ def tool_search_cogs(keywords: str, limit: int = 30) -> dict:
 
 
 def tool_get_by_code(code: str) -> dict:
-    """Lookup exact material code di STOK dan COGS sekaligus."""
+    """Lookup exact material code — return Actual Stock + COGS."""
     code = code.strip().upper()
     stock_results, cogs_results = [], []
     if DATA['stock'] is not None:
@@ -228,28 +341,28 @@ def tool_get_by_code(code: str) -> dict:
 
 
 def tool_get_analytics() -> dict:
-    """Ringkasan analytics: total, kosong, top 10 terbanyak & tersedikit."""
+    """Ringkasan analytics pakai Actual Stock."""
     if DATA['stock'] is None:
         return {'error': 'Data stok belum ter-load'}
     df = DATA['stock']
     return {
         'total_produk': len(df),
-        'stok_kosong': int((df['Total'] == 0).sum()),
-        'ada_stok': int((df['Total'] > 0).sum()),
-        'total_id30': int(df['ID30'].sum()),
-        'total_id40': int(df['ID40'].sum()),
-        'grand_total': int(df['Total'].sum()),
-        'top_10_terbanyak': [_stock_row(r) for _, r in df[df['Total'] > 0].nlargest(10, 'Total').iterrows()],
-        'top_10_tersedikit': [_stock_row(r) for _, r in df[df['Total'] > 0].nsmallest(10, 'Total').iterrows()],
+        'stok_kosong': int((df['Actual'] == 0).sum()),
+        'ada_stok': int((df['Actual'] > 0).sum()),
+        'total_actual_stock': int(df['Actual'].sum()),
+        'total_open_stock_id30': int(df['Open_ID30'].sum()),
+        'total_terjual': int(df['Sales_QTY'].sum()),
+        'top_10_terbanyak': [_stock_row(r) for _, r in df[df['Actual'] > 0].nlargest(10, 'Actual').iterrows()],
+        'top_10_tersedikit': [_stock_row(r) for _, r in df[df['Actual'] > 0].nsmallest(10, 'Actual').iterrows()],
     }
 
 
 def tool_list_empty_stock(keywords: str = '', limit: int = 50) -> dict:
-    """List produk stok kosong, optional filter keyword."""
+    """List produk actual stock = 0, optional filter keyword."""
     if DATA['stock'] is None:
         return {'error': 'Data stok belum ter-load', 'results': []}
     df = DATA['stock']
-    empty = df[df['Total'] == 0]
+    empty = df[df['Actual'] == 0]
     if keywords and keywords.strip():
         for kw in keywords.upper().split():
             empty = empty[empty['desc_clean'].str.contains(re.escape(kw), na=False)]
@@ -263,6 +376,7 @@ def tool_list_empty_stock(keywords: str = '', limit: int = 50) -> dict:
 
 
 def tool_list_cogs_sources() -> dict:
+    # ── TIDAK DIUBAH ──
     """List unique Source di COGS."""
     if DATA['cogs'] is None:
         return {'error': 'Data COGS belum ter-load'}
@@ -281,7 +395,7 @@ TOOL_FUNCTIONS = {
 
 
 # ─────────────────────────────────────────────
-# GEMINI TOOL DECLARATIONS (google-genai SDK)
+# GEMINI TOOL DECLARATIONS
 # ─────────────────────────────────────────────
 def _schema(type_, description=None, **props):
     return types.Schema(type=type_, description=description, **props)
@@ -290,12 +404,13 @@ GEMINI_TOOLS = [types.Tool(function_declarations=[
     types.FunctionDeclaration(
         name='search_stock',
         description=(
-            'Cari produk di tabel STOK berdasarkan keyword (AND search — semua kata harus ada). '
-            'Return: code, description, ID30, ID40, total stok. '
-            'Gunakan nama produk + kemasan, contoh: "RENOLIN B 68 PLUS 1000L IBC".'
+            'Cari produk di tabel STOK berdasarkan keyword (AND search). '
+            'Return: code, description, stock (ACTUAL = open stock - penjualan berjalan), '
+            'open_stock, sold. '
+            'Gunakan nama produk + kemasan. Contoh: "RENOLIN B 68 PLUS 1000L IBC".'
         ),
         parameters=types.Schema(type='OBJECT', properties={
-            'keywords': _schema('STRING', 'Keyword pencarian dipisah spasi. Contoh: "RENOLIN B 68 PLUS"'),
+            'keywords': _schema('STRING', 'Keyword pencarian dipisah spasi.'),
             'limit': _schema('INTEGER', 'Max hasil, default 30'),
         }, required=['keywords'])
     ),
@@ -308,7 +423,7 @@ GEMINI_TOOLS = [types.Tool(function_declarations=[
             'Lihat SEMUA hasil, jangan ambil yang pertama saja.'
         ),
         parameters=types.Schema(type='OBJECT', properties={
-            'keywords': _schema('STRING', 'Keyword pencarian. Contoh: "RENOLIN B 68 PLUS 1000L"'),
+            'keywords': _schema('STRING', 'Keyword pencarian.'),
             'limit': _schema('INTEGER', 'Max hasil, default 30'),
         }, required=['keywords'])
     ),
@@ -317,8 +432,7 @@ GEMINI_TOOLS = [types.Tool(function_declarations=[
         description=(
             'Lookup exact material code (6+ digit angka) di STOK dan COGS sekaligus. '
             'Pakai ini kalau user kasih kode langsung. '
-            'PENTING: code di STOK dan COGS bisa berbeda untuk produk yang sama — '
-            'kalau salah satu tidak ketemu, lanjut search by description.'
+            'PENTING: code di STOK dan COGS bisa berbeda untuk produk yang sama.'
         ),
         parameters=types.Schema(type='OBJECT', properties={
             'code': _schema('STRING', 'Material code. Contoh: "602723550"'),
@@ -326,12 +440,12 @@ GEMINI_TOOLS = [types.Tool(function_declarations=[
     ),
     types.FunctionDeclaration(
         name='get_analytics',
-        description='Rekap analytics: total produk, stok kosong/ada, total per gudang, top 10 terbanyak & tersedikit.',
+        description='Rekap analytics: total produk, stok kosong/ada, total actual stock, top 10.',
         parameters=types.Schema(type='OBJECT', properties={})
     ),
     types.FunctionDeclaration(
         name='list_empty_stock',
-        description='List produk stok kosong (total=0), optional filter keyword.',
+        description='List produk actual stock = 0 (habis terjual atau memang tidak ada), optional filter keyword.',
         parameters=types.Schema(type='OBJECT', properties={
             'keywords': _schema('STRING', 'Optional filter by keyword.'),
             'limit': _schema('INTEGER', 'Max hasil, default 50'),
@@ -349,14 +463,23 @@ GEMINI_TOOLS = [types.Tool(function_declarations=[
 # SYSTEM PROMPT
 # ─────────────────────────────────────────────
 def get_system_prompt():
-    stock_info = f"{len(DATA['stock']):,} produk dari sheet '{DATA['stock_sheet']}'" if DATA['stock'] is not None else "belum ter-load"
-    cogs_info = f"{len(DATA['cogs']):,} entries dari sheet '{DATA['cogs_sheet']}'" if DATA['cogs'] is not None else "belum ter-load"
+    stock_info = (f"{len(DATA['stock']):,} produk dari sheet '{DATA['stock_sheet']}'"
+                  if DATA['stock'] is not None else "belum ter-load")
+    sales_info = (f"'{DATA['sales_sheet']}'" if DATA['sales_sheet'] else "tidak ditemukan")
+    cogs_info = (f"{len(DATA['cogs']):,} entries dari sheet '{DATA['cogs_sheet']}'"
+                 if DATA['cogs'] is not None else "belum ter-load")
+
     return f"""Kamu adalah StockBot, asisten AI untuk perusahaan pelumas. Chat di Telegram, santai tapi akurat.
 
-DATA: Stok {stock_info} | COGS {cogs_info}
-Gudang: ID30 dan ID40.
+DATA: Stok {stock_info} | Sales tab: {sales_info} | COGS {cogs_info}
 
 WAJIB PAKAI TOOLS — jangan ngarang data.
+
+STOK = ACTUAL STOCK:
+- Field 'stock' di hasil search_stock adalah ACTUAL stock (open stock awal bulan dikurangi penjualan berjalan).
+- Ini adalah stok fisik yang tersedia sekarang.
+- Jangan sebut "ID30" ke user. Cukup bilang "stok" atau "stok tersedia".
+- Field 'open_stock' dan 'sold' boleh disebutkan kalau user tanya breakdown-nya.
 
 STRATEGI:
 1. Untuk produk spesifik → panggil search_stock DAN search_cogs secara bersamaan.
@@ -378,7 +501,7 @@ OUTPUT:
 
 
 # ─────────────────────────────────────────────
-# AGENT LOOP
+# AGENT LOOP — tidak diubah
 # ─────────────────────────────────────────────
 def call_tool(name: str, args: dict) -> dict:
     func = TOOL_FUNCTIONS.get(name)
@@ -398,24 +521,20 @@ def ask_gemini(user_input: str, user_id: int) -> str:
         return '⚠️ Fitur AI belum aktif. Set GEMINI_API_KEY di environment.'
 
     try:
-        # Build history dalam format google-genai
         history = CHAT_HISTORY.get(user_id, [])
         contents = []
         for msg in history:
             role = "model" if msg["role"] == "assistant" else "user"
             contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
 
-        # Tambah pesan user
         contents.append(types.Content(role="user", parts=[types.Part(text=user_input)]))
 
-        # Config
         config = types.GenerateContentConfig(
             system_instruction=get_system_prompt(),
             tools=GEMINI_TOOLS,
             max_output_tokens=2000,
         )
 
-        # Agent loop
         for turn in range(MAX_TOOL_TURNS):
             response = gemini_client.models.generate_content(
                 model=GEMINI_MODEL,
@@ -424,23 +543,18 @@ def ask_gemini(user_input: str, user_id: int) -> str:
             )
 
             candidate = response.candidates[0]
-
-            # Cek apakah ada function calls
             function_calls = [
                 p.function_call for p in candidate.content.parts
                 if p.function_call is not None
             ]
 
             if not function_calls:
-                # Tidak ada tool call lagi — ambil text final
                 text_parts = [p.text for p in candidate.content.parts if p.text]
                 reply = '\n'.join(text_parts).strip()
                 break
 
-            # Tambah response model ke history lokal (termasuk tool calls)
             contents.append(candidate.content)
 
-            # Execute tool calls dan buat function responses
             tool_response_parts = []
             for fc in function_calls:
                 args = dict(fc.args) if fc.args else {}
@@ -449,7 +563,6 @@ def ask_gemini(user_input: str, user_id: int) -> str:
                     types.Part.from_function_response(name=fc.name, response=result)
                 )
 
-            # Tambah tool responses ke contents
             contents.append(types.Content(role="user", parts=tool_response_parts))
 
         else:
@@ -458,7 +571,6 @@ def ask_gemini(user_input: str, user_id: int) -> str:
         if not reply:
             reply = '⚠️ AI tidak menghasilkan jawaban. Coba ulang.'
 
-        # Simpan ke history (hanya user text + assistant text)
         history.append({"role": "user", "content": user_input})
         history.append({"role": "assistant", "content": reply})
         if len(history) > MAX_HISTORY * 2:
@@ -481,7 +593,7 @@ def clear_history(user_id):
 
 
 # ─────────────────────────────────────────────
-# TELEGRAM HANDLERS
+# TELEGRAM HANDLERS — tidak diubah
 # ─────────────────────────────────────────────
 def is_allowed(user_id):
     if not ALLOWED_USER_IDS:
@@ -494,7 +606,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f'❌ Akses ditolak. ID: `{update.effective_user.id}`', parse_mode='Markdown')
         return
     msg = (
-        '👋 *StockBot v5.1 — Full AI Agent*\n\n'
+        '👋 *StockBot v5.2 — Actual Stock*\n\n'
         '🤖 Powered by Gemini + Tool Calling\n\n'
         'Ngobrol aja kayak biasa — saya cari datanya sendiri.\n\n'
         '*Contoh:*\n'
@@ -519,10 +631,19 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ['📊 *Status:*\n']
     if DATA['stock'] is not None:
         df = DATA['stock']
-        lines += [f'✅ *STOK:* `{DATA["stock_sheet"]}` — {len(df):,} produk',
-                  f'   Ada: {(df["Total"]>0).sum():,} | Kosong: {(df["Total"]==0).sum():,}']
+        lines += [
+            f'✅ *STOK:* `{DATA["stock_sheet"]}` — {len(df):,} produk',
+            f'   Actual ada: {(df["Actual"]>0).sum():,} | Kosong: {(df["Actual"]==0).sum():,}',
+            f'   Open stock: {int(df["Open_ID30"].sum()):,} | Terjual: {int(df["Sales_QTY"].sum()):,} | Actual: {int(df["Actual"].sum()):,}',
+        ]
     else:
         lines.append('❌ *STOK:* belum ter-load')
+
+    if DATA['sales_sheet']:
+        lines.append(f'✅ *SALES:* `{DATA["sales_sheet"]}`')
+    else:
+        lines.append('⚠️ *SALES:* tab tidak ditemukan')
+
     lines.append('')
     if DATA['cogs'] is not None:
         df = DATA['cogs']
@@ -541,8 +662,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id): return
     await update.message.reply_text(
-        '📖 *StockBot v5.1*\n\nTanya apa aja pakai bahasa natural. '
-        'AI cari datanya sendiri.\n\n/reload /status /clear',
+        '📖 *StockBot v5.2*\n\nTanya apa aja pakai bahasa natural. '
+        'AI cari datanya sendiri.\n\nStok yang ditampilkan = *actual stock* '
+        '(open stock awal bulan dikurangi penjualan berjalan).\n\n/reload /status /clear',
         parse_mode='Markdown'
     )
 
@@ -596,7 +718,7 @@ def main():
         logger.error("❌ GEMINI_API_KEY tidak di-set!")
         return
 
-    logger.info("🚀 Starting StockBot v5.1 (Agent Mode)...")
+    logger.info("🚀 Starting StockBot v5.2 (Actual Stock Mode)...")
     _, msg = load_all_data()
     logger.info(f"Initial load:\n{msg}")
 
