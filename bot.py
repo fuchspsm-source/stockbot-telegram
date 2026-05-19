@@ -501,7 +501,7 @@ OUTPUT:
 
 
 # ─────────────────────────────────────────────
-# AGENT LOOP — tidak diubah
+# AGENT LOOP
 # ─────────────────────────────────────────────
 def call_tool(name: str, args: dict) -> dict:
     func = TOOL_FUNCTIONS.get(name)
@@ -525,14 +525,17 @@ def ask_gemini(user_input: str, user_id: int) -> str:
         contents = []
         for msg in history:
             role = "model" if msg["role"] == "assistant" else "user"
-            contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
+            # FIX: Menggunakan Part.from_text sesuai dengan update SDK google-genai
+            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])]))
 
-        contents.append(types.Content(role="user", parts=[types.Part(text=user_input)]))
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_input)]))
 
+        # FIX: Tambah parameter temperature=0.1 agar tool calling lebih deterministic & tidak halu
         config = types.GenerateContentConfig(
             system_instruction=get_system_prompt(),
             tools=GEMINI_TOOLS,
             max_output_tokens=2000,
+            temperature=0.1, 
         )
 
         for turn in range(MAX_TOOL_TURNS):
@@ -593,7 +596,7 @@ def clear_history(user_id):
 
 
 # ─────────────────────────────────────────────
-# TELEGRAM HANDLERS — tidak diubah
+# TELEGRAM HANDLERS
 # ─────────────────────────────────────────────
 def is_allowed(user_id):
     if not ALLOWED_USER_IDS:
